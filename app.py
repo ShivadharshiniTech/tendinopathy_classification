@@ -3,8 +3,29 @@ import joblib
 import time
 from pathlib import Path
 import pandas as pd
+import numpy as np
+
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    _HAS_PLOTLY = True
+except Exception:
+    px = None
+    go = None
+    _HAS_PLOTLY = False
 
 from utils import load_summary_csv
+from sklearn.metrics import (
+    roc_auc_score,
+    accuracy_score,
+    confusion_matrix,
+    precision_score,
+    recall_score,
+    f1_score,
+    precision_recall_curve,
+    roc_curve,
+    brier_score_loss,
+)
 
 
 @st.cache_resource
@@ -15,16 +36,131 @@ def load_saved_model(path='model.joblib'):
     return joblib.load(p)
 
 
-def predict_df(model_obj, df):
+def predict_df(model_obj, df, prob_col_name='prob_tendinopathy'):
     model = model_obj['model']
     features = model_obj['features']
     X = df[features]
     proba = model.predict_proba(X)[:, 1]
     pred = (proba >= 0.5).astype(int)
     out = df.copy()
-    out['prob_tendinopathy'] = proba
+    out[prob_col_name] = proba
     out['pred_tendinopathy'] = pred
     return out
+
+
+@st.cache_resource
+def load_test_results(path='test_results.csv'):
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        return pd.read_csv(p)
+    except Exception:
+        return None
+
+
+def evaluation_panel(df):
+    st.header('Evaluation: Test set')
+
+    st.write('Rows in test set:', len(df))
+
+    # determine columns
+    prob_col = None
+    if 'prob' in df.columns:
+        prob_col = 'prob'
+    elif 'prob_tendinopathy' in df.columns:
+        prob_col = 'prob_tendinopathy'
+
+    if 'true_label' not in df.columns and 'true' in df.columns:
+        df = df.rename(columns={'true': 'true_label'})
+
+    if 'true_label' not in df.columns:
+        st.warning('No true labels found in test set (no `true_label` column). Metrics unavailable.')
+        st.dataframe(df.head())
+        return
+
+    y_true = df['true_label'].astype(int).values
+
+    # default threshold slider
+    if prob_col is not None:
+        probs = df[prob_col].astype(float).values
+        thresh = st.slider('Classification threshold', 0.0, 1.0, 0.5)
+        y_pred = (probs >= thresh).astype(int)
+    elif 'pred' in df.columns:
+        y_pred = df['pred'].astype(int).values
+        probs = None
+        thresh = None
+    else:
+        st.warning('No probability or prediction column found. Cannot compute metrics.')
+        st.dataframe(df.head())
+        return
+
+    # metrics
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec = recall_score(y_true, y_pred, zero_division=0)
+    f1 = f1_score(y_true, y_pred, zero_division=0)
+
+    cols = st.columns(4)
+    cols[0].metric('Accuracy', f'{acc:.3f}')
+    cols[1].metric('Precision', f'{prec:.3f}')
+    cols[2].metric('Recall', f'{rec:.3f}')
+    cols[3].metric('F1', f'{f1:.3f}')
+
+    if probs is not None:
+        try:
+            auc = roc_auc_score(y_true, probs)
+        except Exception:
+            auc = float('nan')
+        brier = brier_score_loss(y_true, probs)
+        st.write(f'ROC AUC: {auc:.3f}  —  Brier score: {brier:.4f}')
+
+    # If plotly isn't available, show instructions and a compact metrics summary
+    if not _HAS_PLOTLY:
+        st.error('The `plotly` package is not installed in this environment. Install it with:')
+        st.code('pip install plotly', language='bash')
+        st.write('Metrics:')
+        st.write(f'Accuracy: {acc:.3f}  Precision: {prec:.3f}  Recall: {rec:.3f}  F1: {f1:.3f}')
+        if probs is not None:
+            try:
+                auc = roc_auc_score(y_true, probs)
+            except Exception:
+                auc = float('nan')
+            brier = brier_score_loss(y_true, probs)
+            st.write(f'ROC AUC: {auc:.3f}  —  Brier score: {brier:.4f}')
+        st.subheader('Test set preview')
+        st.dataframe(df.head())
+        return
+
+    # confusion matrix (plotly)
+    cm = confusion_matrix(y_true, y_pred)
+    fig_cm = px.imshow(cm, text_auto=True, labels=dict(x='Predicted', y='Actual'), x=[0,1], y=[0,1], color_continuous_scale='Blues')
+    st.plotly_chart(fig_cm, use_container_width=True)
+
+    # ROC curve
+    if probs is not None:
+        fpr, tpr, _ = roc_curve(y_true, probs)
+        fig_roc = go.Figure()
+        fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name='ROC'))
+        fig_roc.add_trace(go.Scatter(x=[0,1], y=[0,1], mode='lines', line=dict(dash='dash'), showlegend=False))
+        fig_roc.update_layout(xaxis_title='False Positive Rate', yaxis_title='True Positive Rate', height=400)
+        st.plotly_chart(fig_roc, use_container_width=True)
+
+        # Precision-Recall
+        precision, recall_vals, _ = precision_recall_curve(y_true, probs)
+        fig_pr = go.Figure()
+        fig_pr.add_trace(go.Scatter(x=recall_vals, y=precision, mode='lines', name='PR'))
+        fig_pr.update_layout(xaxis_title='Recall', yaxis_title='Precision', height=400)
+        st.plotly_chart(fig_pr, use_container_width=True)
+
+        # Probability histogram
+        hist_df = pd.DataFrame({'prob': probs, 'true': y_true, 'pred': y_pred})
+        fig_hist = px.histogram(hist_df, x='prob', color='true', nbins=20, barmode='overlay', opacity=0.7, labels={'true':'True label'})
+        fig_hist.update_layout(height=350)
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+    st.subheader('Test set preview')
+    st.dataframe(df.head())
 
 
 def main():
@@ -94,6 +230,28 @@ def main():
                     text += f'— Pred prob={p.prob_tendinopathy:.3f} — class={int(p.pred_tendinopathy)}'
                 placeholder.write(text)
                 time.sleep(0.6)
+
+    st.header('3) Evaluation (interactive)')
+    st.write('You can load the `test_results.csv` produced by training, or upload your own test CSV with `true_label` and `prob`/`pred` columns.')
+
+    # Option to load bundled test_results.csv or upload
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        if st.button('Load workspace test_results.csv'):
+            test_df = load_test_results('test_results.csv')
+        else:
+            test_df = None
+    with col2:
+        uploaded_test = st.file_uploader('Or upload test CSV', type=['csv'], key='test_upload')
+        if uploaded_test is not None:
+            try:
+                test_df = pd.read_csv(uploaded_test)
+            except Exception as e:
+                st.error(f'Failed to read uploaded test CSV: {e}')
+                test_df = None
+
+    if test_df is not None:
+        evaluation_panel(test_df)
 
 
 if __name__ == '__main__':

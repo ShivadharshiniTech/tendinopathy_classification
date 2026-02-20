@@ -3,3 +3,4 @@ scikit-learn
 joblib
 streamlit
 shap
+plotly>=5.0
