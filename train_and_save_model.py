@@ -4,13 +4,29 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import GroupKFold, GroupShuffleSplit, cross_val_score, train_test_split, StratifiedKFold
-from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix, balanced_accuracy_score, recall_score, precision_score, brier_score_loss
+from sklearn.model_selection import (
+    GroupKFold, GroupShuffleSplit, cross_val_score, 
+    train_test_split, StratifiedKFold, LeaveOneGroupOut, cross_validate
+)
+from sklearn.metrics import (
+    roc_auc_score, accuracy_score, confusion_matrix, balanced_accuracy_score, 
+    recall_score, precision_score, brier_score_loss, make_scorer
+)
+try:
+    from imblearn.over_sampling import SMOTE
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    HAS_IMBLEARN = True
+except ImportError:
+    ImbPipeline = Pipeline
+    SMOTE = None
+    HAS_IMBLEARN = False
 
 from utils import load_summary_csv
 import random
+import warnings
 
 
 def pick_feature_columns(df):
@@ -50,83 +66,137 @@ def main(args):
     df = load_summary_csv(path)
 
     X, y, groups, features = prepare_data(df)
-    # First try: stratified row-wise split (keeps class ratios by rows)
-    try:
+    
+    # Dataset diagnostics
+    n_subjects = groups.nunique()
+    n_samples = len(X)
+    print(f'\n=== Dataset Info ===')
+    print(f'Total samples: {n_samples}')
+    print(f'Unique subjects: {n_subjects}')
+    print(f'Class distribution: {dict(y.value_counts())}')
+    print(f'Samples per subject: {groups.value_counts().describe().to_dict()}')
+    
+    # For very small datasets (<=5 subjects), recommend LeaveOneGroupOut
+    if n_subjects <= 5:
+        print(f'\n⚠️  WARNING: Only {n_subjects} subjects detected. This is a VERY SMALL dataset.')
+        print('Recommended approach: Use LeaveOneGroupOut cross-validation for realistic estimates.')
+        print('Model will likely have high variance and may not generalize well.\n')
+    
+    # Use group-aware split to prevent subject leakage
+    if 'Subject' in df.columns and n_subjects >= 2:
+        print('Using GROUP-AWARE split (by Subject) to prevent data leakage...')
+        gss = GroupShuffleSplit(n_splits=1, test_size=args.test_size, random_state=42)
+        train_idx, test_idx = next(gss.split(X, y, groups))
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        groups_train = groups.iloc[train_idx]
+        
+        # Verify no subject appears in both train and test
+        train_subjects = set(groups_train.unique())
+        test_subjects = set(groups.iloc[test_idx].unique())
+        assert len(train_subjects & test_subjects) == 0, 'Subject leakage detected!'
+        
+        print(f'Train: {len(X_train)} samples, {len(train_subjects)} subjects')
+        print(f'Test: {len(X_test)} samples, {len(test_subjects)} subjects')
+        print(f'Train classes: {dict(y_train.value_counts())}')
+        print(f'Test classes: {dict(y_test.value_counts())}')
+    else:
+        print('Using stratified row-wise split (no Subject grouping)...')
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=args.test_size, stratify=y, random_state=42
         )
-        # ensure both classes present in train
-        if len(np.unique(y_train)) < 2:
-            raise ValueError('train split has only one class')
-    except Exception:
-        # fallback: if Subject exists, try many random group-aware splits to preserve class balance
-        if 'Subject' in df.columns:
-            print('Row-wise stratified split failed; attempting group-aware stratified split by Subject')
-            groups_arr = df['Subject'].values
-            unique_groups = list(pd.Series(groups_arr).unique())
-            n_trials = 2000
-            success = False
-            rng = random.Random(42)
-            for _ in range(n_trials):
-                rng.shuffle(unique_groups)
-                test_groups = set()
-                n_total = len(df)
-                target_test_n = int(max(1, round(args.test_size * n_total)))
-                curr_n = 0
-                for g in unique_groups:
-                    g_count = int((groups_arr == g).sum())
-                    if curr_n + g_count <= target_test_n or len(test_groups) == 0:
-                        test_groups.add(g)
-                        curr_n += g_count
-                    if curr_n >= target_test_n:
-                        break
-                test_idx = df[df.Subject.isin(test_groups)].index
-                train_idx = df[~df.index.isin(test_idx)].index
-                y_train_try = y.loc[train_idx]
-                y_test_try = y.loc[test_idx]
-                if len(y_train_try) > 0 and len(y_test_try) > 0 and len(np.unique(y_train_try)) >= 2:
-                    X_train, X_test = X.loc[train_idx], X.loc[test_idx]
-                    y_train, y_test = y.loc[train_idx], y.loc[test_idx]
-                    success = True
-                    print('Found group-aware split with', len(train_idx), 'train rows and', len(test_idx), 'test rows')
-                    break
-            if not success:
-                print('Could not find a group-aware split that preserves classes. Will train on full data (no held-out test).')
-                X_train, X_test, y_train, y_test = X, pd.DataFrame(columns=X.columns), y, pd.Series([], dtype=int)
-        else:
-            print('Stratified split failed and no Subject column found; will train on full data (no held-out test).')
-            X_train, X_test, y_train, y_test = X, pd.DataFrame(columns=X.columns), y, pd.Series([], dtype=int)
+        groups_train = None
 
-    clf = Pipeline([
-        ('scaler', StandardScaler()),
-        ('rf', RandomForestClassifier(n_estimators=200, class_weight='balanced', random_state=42))
-    ])
+    # Choose model based on dataset size
+    if args.model == 'logistic':
+        print('Using Logistic Regression (good for small datasets)...')
+        model = LogisticRegression(C=0.1, class_weight='balanced', max_iter=1000, random_state=42)
+    else:
+        print('Using Random Forest...')
+        # Use fewer trees for small datasets to reduce overfitting
+        n_estimators = 100 if n_subjects <= 5 else 200
+        model = RandomForestClassifier(
+            n_estimators=n_estimators, 
+            max_depth=3 if n_subjects <= 5 else None,  # Limit depth for small datasets
+            class_weight='balanced', 
+            random_state=42
+        )
+    
+    # Build pipeline with optional SMOTE
+    if args.use_smote and HAS_IMBLEARN:
+        print('Using SMOTE for training data augmentation...')
+        clf = ImbPipeline([
+            ('scaler', StandardScaler()),
+            ('smote', SMOTE(random_state=42, k_neighbors=1)),
+            ('model', model)
+        ])
+    else:
+        if args.use_smote and not HAS_IMBLEARN:
+            print('⚠️  SMOTE requested but imbalanced-learn not installed. Install with: pip install imbalanced-learn')
+        clf = Pipeline([
+            ('scaler', StandardScaler()),
+            ('model', model)
+        ])
 
-    # Check class distribution in training set
+    # Cross-validation strategy based on dataset size
     unique, counts = np.unique(y_train, return_counts=True)
-    class_counts = dict(zip(unique, counts))
     if len(unique) < 2:
-        print('WARNING: Training set contains only one class:', unique)
-        print('Training will proceed but the model will predict a constant class. Collect more labeled data with both classes for meaningful results.')
-
-    # cross-validate on train set (stratified) only if enough samples per class
+        print('⚠️  WARNING: Training set contains only one class:', unique)
+        print('Cannot train a meaningful classifier. Collect more diverse data.')
+        return
+    
+    print('\n=== Cross-Validation ===')
+    if groups_train is not None and n_subjects <= 5:
+        # Use LeaveOneGroupOut for very small subject counts
+        print(f'Using LeaveOneGroupOut CV ({n_subjects} folds)...')
+        cv = LeaveOneGroupOut()
+        cv_groups = groups_train
+    elif groups_train is not None:
+        # Use GroupKFold for larger datasets
+        n_splits = min(5, n_subjects)
+        print(f'Using GroupKFold CV ({n_splits} folds)...')
+        cv = GroupKFold(n_splits=n_splits)
+        cv_groups = groups_train
+    else:
+        # Stratified KFold when no groups
+        n_splits = min(5, counts.min())
+        print(f'Using StratifiedKFold CV ({n_splits} folds)...')
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        cv_groups = None
+    
+    # Perform cross-validation with multiple metrics
+    scoring = {
+        'roc_auc': 'roc_auc',
+        'accuracy': 'accuracy',
+        'balanced_accuracy': 'balanced_accuracy',
+        'precision': 'precision',
+        'recall': 'recall',
+        'f1': 'f1'
+    }
+    
     try:
-        n_min_class = counts.min()
-        if n_min_class < 2:
-            print('Not enough samples per class for cross-validation (need >=2 per class). Skipping CV.')
-            scores = []
-        else:
-            n_splits = min(5, n_min_class)
-            if n_splits < 2:
-                print('Not enough samples to run CV. Skipping CV.')
-                scores = []
-            else:
-                skf = StratifiedKFold(n_splits=n_splits)
-                scores = cross_val_score(clf, X_train, y_train, cv=skf, scoring='roc_auc')
-                print('Train Stratified CV ROC AUC scores:', scores)
-                print('Mean train AUC:', np.nanmean(scores))
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore')
+            cv_results = cross_validate(
+                clf, X_train, y_train, 
+                groups=cv_groups,
+                cv=cv, 
+                scoring=scoring,
+                return_train_score=True,
+                n_jobs=-1
+            )
+        
+        print('\nCross-Validation Results (mean ± std):')
+        for metric in scoring.keys():
+            test_scores = cv_results[f'test_{metric}']
+            print(f'  {metric:20s}: {test_scores.mean():.3f} ± {test_scores.std():.3f}')
+        
+        print('\n⚠️  NOTE: With only {} subjects, these estimates have HIGH VARIANCE.'.format(n_subjects))
+        print('Consider collecting more subjects for reliable model evaluation.')
+        
     except Exception as e:
-        print('Cross-validation on train set failed:', e)
+        print(f'Cross-validation failed: {e}')
+        print('Proceeding with simple train/test split evaluation...')
 
     # fit on train set
     clf.fit(X_train, y_train)
@@ -192,11 +262,15 @@ def main(args):
 
 
 if __name__ == '__main__':
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description='Train tendinopathy classifier with proper handling of small datasets')
     p.add_argument('--summary', default='dataset/PainModel_Summary_AllSubjects_2 (1).csv')
     p.add_argument('--out', default='model.joblib')
     p.add_argument('--test-out', default='test_results.csv')
     p.add_argument('--test-size', type=float, default=0.2)
+    p.add_argument('--model', choices=['rf', 'logistic'], default='rf', 
+                   help='Model type: rf (Random Forest) or logistic (Logistic Regression, better for small data)')
+    p.add_argument('--use-smote', action='store_true', 
+                   help='Use SMOTE for training data augmentation (requires imbalanced-learn)')
     p.add_argument('--save-full', action='store_true', help='Also train on full dataset and save a second model')
     p.add_argument('--full-out', default='model_full_data.joblib')
     args = p.parse_args()

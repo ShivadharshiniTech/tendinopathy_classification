@@ -4,3 +4,5 @@ joblib
 streamlit
 shap
 plotly>=5.0
+imbalanced-learn
+matplotlib
