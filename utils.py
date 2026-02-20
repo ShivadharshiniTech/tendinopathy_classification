@@ -88,3 +88,20 @@ def aggregate_eventcycle_to_summary(df):
     # fill NaN std with 0
     agg['Std_Pain'] = agg['Std_Pain'].fillna(0)
     return agg
+
+
+def load_temporal_features(path='dataset/temporal_features.csv'):
+    """Load temporal features CSV extracted from EventCycle data.
+    
+    Returns a DataFrame with 23 temporal features per trial:
+    - peak_pain, mean_pain, min_pain, std_pain, median_pain
+    - pain_slope, time_to_peak, pain_acceleration
+    - early_pain, mid_pain, late_pain
+    - percentile_25, percentile_75, percentile_95, iqr_pain
+    - pain_range, pain_cv, pain_skewness, pain_kurtosis
+    - onset_rate, offset_rate, sustained_pain_ratio, zero_pain_ratio
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f'Temporal features CSV not found at {path}')
+    return pd.read_csv(p)

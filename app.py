@@ -14,7 +14,7 @@ except Exception:
     go = None
     _HAS_PLOTLY = False
 
-from utils import load_summary_csv
+from utils import load_temporal_features
 from sklearn.metrics import (
     roc_auc_score,
     accuracy_score,
@@ -29,18 +29,40 @@ from sklearn.metrics import (
 
 
 @st.cache_resource
-def load_saved_model(path='model.joblib'):
+def load_saved_model(path='model_temporal.joblib'):
     p = Path(path)
     if not p.exists():
         return None
     return joblib.load(p)
 
 
-def predict_df(model_obj, df, prob_col_name='prob_tendinopathy'):
+@st.cache_resource
+def load_saved_scaler(path='scaler_temporal.joblib'):
+    p = Path(path)
+    if not p.exists():
+        return None
+    return joblib.load(p)
+
+
+def predict_df(model_obj, scaler_obj, df, prob_col_name='prob_tendinopathy'):
     model = model_obj['model']
     features = model_obj['features']
+    
+    # Try to get scaler from model_obj first (new format), fall back to scaler_obj parameter
+    if 'scaler' in model_obj:
+        scaler = model_obj['scaler']
+    else:
+        scaler = scaler_obj
+    
     X = df[features]
-    proba = model.predict_proba(X)[:, 1]
+    
+    # Apply scaler if available (temporal model requires scaling)
+    if scaler is not None:
+        X_scaled = scaler.transform(X)
+    else:
+        X_scaled = X
+    
+    proba = model.predict_proba(X_scaled)[:, 1]
     pred = (proba >= 0.5).astype(int)
     out = df.copy()
     out[prob_col_name] = proba
@@ -49,7 +71,7 @@ def predict_df(model_obj, df, prob_col_name='prob_tendinopathy'):
 
 
 @st.cache_resource
-def load_test_results(path='test_results.csv'):
+def load_test_results(path='test_results_temporal.csv'):
     p = Path(path)
     if not p.exists():
         return None
@@ -164,17 +186,30 @@ def evaluation_panel(df):
 
 
 def main():
-    st.title('Tendinopathy classifier — demo')
+    st.title('Tendinopathy Classifier — Temporal Features Model')
 
     st.sidebar.header('Model')
-    model_obj = load_saved_model('model.joblib')
+    model_obj = load_saved_model('model_temporal.joblib')
+    scaler_obj = load_saved_scaler('scaler_temporal.joblib')
+    
     if model_obj is None:
-        st.sidebar.warning('No model.joblib found. Run `train_and_save_model.py` first.')
+        st.sidebar.warning('No model_temporal.joblib found. Run `train_temporal_model.py` first.')
     else:
-        st.sidebar.success('Loaded model.joblib')
+        st.sidebar.success('✓ Loaded temporal features model')
+        st.sidebar.info(f'Features: {len(model_obj["features"])} temporal features')
+        st.sidebar.caption('Model: Logistic Regression with L2 regularization')
+        
+        # Check if scaler is in model or needs separate file
+        if 'scaler' in model_obj:
+            st.sidebar.success('✓ Feature scaler included in model')
+        elif scaler_obj is not None:
+            st.sidebar.success('✓ Loaded feature scaler (legacy format)')
+        else:
+            st.sidebar.warning('⚠ No scaler found. Predictions may be incorrect!')
 
-    st.header('1) Upload data (per-row)')
-    uploaded = st.file_uploader('Upload CSV where each row is one observation', type=['csv'])
+    st.header('1) Upload Temporal Features Data')
+    st.caption('Upload a CSV with 23 temporal features extracted from EventCycle data. Use extract_temporal_features.py to generate this from raw EventCycle CSV.')
+    uploaded = st.file_uploader('Upload temporal features CSV', type=['csv'])
 
     if uploaded is not None:
         try:
@@ -193,18 +228,69 @@ def main():
                     st.warning(f'Model expects feature `{f}` but it is missing. Filling with 0.')
                     data_df[f] = 0
 
-            preds = predict_df(model_obj, data_df)
+            preds = predict_df(model_obj, scaler_obj, data_df)
             st.subheader('Predictions')
+            
+            # Build output columns
             cols = []
             if 'Subject' in preds.columns:
                 cols += ['Subject']
             if 'Condition' in preds.columns:
                 cols += ['Condition']
-            cols += model_obj['features'] + ['prob_tendinopathy', 'pred_tendinopathy']
+            
+            # Check if true labels exist
+            has_true_label = False
+            true_label_col = None
+            if 'true_label' in preds.columns:
+                true_label_col = 'true_label'
+                has_true_label = True
+            elif 'target' in preds.columns:
+                true_label_col = 'target'
+                has_true_label = True
+            elif 'label' in preds.columns:
+                true_label_col = 'label'
+                has_true_label = True
+            
+            if has_true_label:
+                cols += [true_label_col]
+            
+            cols += ['prob_tendinopathy', 'pred_tendinopathy']
+            
+            # Add key features at the end
+            key_features = ['peak_pain', 'mean_pain', 'pain_acceleration', 'time_to_peak']
+            for feat in key_features:
+                if feat in preds.columns and feat not in cols:
+                    cols.append(feat)
+            
             st.dataframe(preds[cols])
+            
+            # Show metrics if true labels are present
+            if has_true_label:
+                st.subheader('Performance Metrics')
+                y_true = preds[true_label_col].astype(int).values
+                y_prob = preds['prob_tendinopathy'].values
+                y_pred = preds['pred_tendinopathy'].astype(int).values
+                
+                acc = accuracy_score(y_true, y_pred)
+                prec = precision_score(y_true, y_pred, zero_division=0)
+                rec = recall_score(y_true, y_pred, zero_division=0)
+                f1 = f1_score(y_true, y_pred, zero_division=0)
+                
+                cols_metric = st.columns(4)
+                cols_metric[0].metric('Accuracy', f'{acc:.3f}')
+                cols_metric[1].metric('Precision', f'{prec:.3f}')
+                cols_metric[2].metric('Recall', f'{rec:.3f}')
+                cols_metric[3].metric('F1 Score', f'{f1:.3f}')
+                
+                try:
+                    auc = roc_auc_score(y_true, y_prob)
+                    st.write(f'**ROC AUC:** {auc:.3f}')
+                except Exception:
+                    pass
 
-    st.header('2) Live replay simulator (CSV rows)')
-    sim_file = st.file_uploader('Upload CSV to replay rows', type=['csv'], key='sim')
+    st.header('2) Live Replay Simulator')
+    st.caption('Upload temporal features CSV to replay predictions row-by-row.')
+    sim_file = st.file_uploader('Upload temporal features CSV', type=['csv'], key='sim')
     if sim_file is not None:
         try:
             sim_df = pd.read_csv(sim_file)
@@ -220,25 +306,47 @@ def main():
                     text += f'Subject {row.Subject} '
                 if 'Condition' in row:
                     text += f'— {row.Condition} '
+                
+                # Check for true label
+                true_label = None
+                if 'true_label' in row:
+                    true_label = int(row.true_label)
+                elif 'target' in row:
+                    true_label = int(row.target)
+                elif 'label' in row:
+                    true_label = int(row.label)
+                
+                if true_label is not None:
+                    text += f'— True: {true_label} '
+                
                 # ensure features
                 r = row.to_frame().T
                 for f in (model_obj['features'] if model_obj is not None else []):
                     if f not in r.columns:
                         r[f] = 0
                 if model_obj is not None:
-                    p = predict_df(model_obj, r)[['prob_tendinopathy', 'pred_tendinopathy']].iloc[0]
-                    text += f'— Pred prob={p.prob_tendinopathy:.3f} — class={int(p.pred_tendinopathy)}'
+                    p = predict_df(model_obj, scaler_obj, r)[['prob_tendinopathy', 'pred_tendinopathy']].iloc[0]
+                    pred_class = int(p.pred_tendinopathy)
+                    text += f'— Pred: {pred_class} (prob={p.prob_tendinopathy:.3f})'
+                    
+                    # Add checkmark or X if we have true label
+                    if true_label is not None:
+                        if pred_class == true_label:
+                            text += ' ✓'
+                        else:
+                            text += ' ✗'
+                
                 placeholder.write(text)
                 time.sleep(0.6)
 
-    st.header('3) Evaluation (interactive)')
-    st.write('You can load the `test_results.csv` produced by training, or upload your own test CSV with `true_label` and `prob`/`pred` columns.')
+    st.header('3) Model Evaluation (Interactive)')
+    st.write('Load the `test_results_temporal.csv` from training, or upload your own test CSV with `true_label` and `prob`/`pred` columns.')
 
-    # Option to load bundled test_results.csv or upload
+    # Option to load bundled test_results_temporal.csv or upload
     col1, col2 = st.columns([1, 2])
     with col1:
-        if st.button('Load workspace test_results.csv'):
-            test_df = load_test_results('test_results.csv')
+        if st.button('Load test_results_temporal.csv'):
+            test_df = load_test_results('test_results_temporal.csv')
         else:
             test_df = None
     with col2:

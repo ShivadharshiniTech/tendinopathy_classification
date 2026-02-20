@@ -114,8 +114,9 @@ def train_temporal_model(model_type='logistic', test_size=0.25, random_state=42)
         'f1': 'f1'
     }
     
-    # Perform CV on full dataset
-    X_all_scaled = scaler.fit_transform(X)
+    # Perform CV on full dataset (use training scaler for consistency)
+    # NOTE: transform only, don't refit the scaler!
+    X_all_scaled = scaler.transform(X)
     cv_results = cross_validate(
         model, X_all_scaled, y, 
         groups=groups,
@@ -197,8 +198,8 @@ def train_temporal_model(model_type='logistic', test_size=0.25, random_state=42)
             print(f"{row['feature']:25s} {direction} {row['abs_importance']:.3f}")
     
     # Save artifacts
-    joblib.dump({'model': model, 'features': FEATURES}, 'model_temporal.joblib')
-    joblib.dump(scaler, 'scaler_temporal.joblib')
+    joblib.dump({'model': model, 'scaler': scaler, 'features': FEATURES}, 'model_temporal.joblib')
+    joblib.dump(scaler, 'scaler_temporal.joblib')  # Also save separately for backward compatibility
     
     # Save test results
     test_df = features_df.iloc[test_idx].copy()
