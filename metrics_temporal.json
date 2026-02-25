@@ -1,0 +1,65 @@
+{
+  "train": {
+    "n": 24,
+    "accuracy": 1.0,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "confusion_matrix": [
+      [
+        12,
+        0
+      ],
+      [
+        0,
+        12
+      ]
+    ],
+    "roc_auc": 1.0,
+    "brier": 0.036046668777887786
+  },
+  "test": {
+    "n": 12,
+    "accuracy": 0.8333333333333334,
+    "precision": 0.8333333333333334,
+    "recall": 0.8333333333333334,
+    "f1": 0.8333333333333334,
+    "confusion_matrix": [
+      [
+        5,
+        1
+      ],
+      [
+        1,
+        5
+      ]
+    ],
+    "roc_auc": 0.9722222222222223,
+    "brier": 0.07976727265692235
+  },
+  "features": [
+    "peak_pain",
+    "mean_pain",
+    "median_pain",
+    "min_pain",
+    "std_pain",
+    "pain_range",
+    "pain_cv",
+    "iqr_pain",
+    "percentile_95",
+    "percentile_75",
+    "percentile_25",
+    "percentile_5",
+    "time_to_peak",
+    "pain_slope",
+    "pain_curvature",
+    "early_pain",
+    "mid_pain",
+    "late_pain",
+    "pain_acceleration",
+    "pain_skewness",
+    "pain_kurtosis",
+    "onset_rate",
+    "offset_rate"
+  ]
+}
