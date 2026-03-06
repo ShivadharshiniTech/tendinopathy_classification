@@ -26,6 +26,12 @@ except Exception:
     _HAS_SHAP = False
 
 try:
+    from openai import OpenAI
+    _HAS_OPENAI = True
+except Exception:
+    _HAS_OPENAI = False
+
+try:
     from google import genai
     _HAS_GEMINI = True
 except Exception:
@@ -384,15 +390,8 @@ def plot_pain_curve(raw_event_data, trial_info):
     st.plotly_chart(fig, use_container_width=True)
 
 
-def generate_llm_explanation(prediction, prob, top_features, trial_info, gemini_api_key=None):
-    """Generate natural language explanation using Gemini LLM"""
-    if not _HAS_GEMINI:
-        st.error('Google GenAI not installed. Run: pip install google-genai')
-        return None
-    
-    if gemini_api_key is None or gemini_api_key.strip() == '':
-        st.warning('No Gemini API key provided. Enter your key in the sidebar.')
-        return None
+def generate_llm_explanation(prediction, prob, top_features, trial_info, groq_api_key=None, gemini_api_key=None):
+    """Generate natural language explanation using Groq (primary) or Gemini (fallback) LLM"""
     
     # Build prompt
     condition = "Tendinopathy" if prediction == 1 else "Normal"
@@ -447,7 +446,38 @@ Explain the results in simple, non-technical language that a patient without med
 
 Keep each section clear, actionable, and evidence-based."""
 
-    # Try multiple model names until one works
+    # Try Groq API first (primary)
+    if _HAS_OPENAI and groq_api_key and groq_api_key.strip():
+        try:
+            client = OpenAI(
+                api_key=groq_api_key,
+                base_url="https://api.groq.com/openai/v1"
+            )
+            
+            completion = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": "You are a clinical biomechanics expert specializing in tendinopathy assessment."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7,
+                max_tokens=2000
+            )
+            
+            return completion.choices[0].message.content, "Groq (Llama-3.1-70b)"
+        except Exception as e:
+            st.warning(f'⚠️ Groq API failed: {e}. Trying Gemini fallback...')
+    
+    # Fallback to Gemini API
+    if not _HAS_GEMINI:
+        st.error('Neither Groq nor Gemini API available. Install: pip install openai google-genai')
+        return None, None
+    
+    if gemini_api_key is None or gemini_api_key.strip() == '':
+        st.warning('No API keys provided. Enter Groq or Gemini API key in the sidebar.')
+        return None, None
+    
+    # Try Gemini models
     client = genai.Client(api_key=gemini_api_key)
     
     model_names = [
@@ -467,14 +497,15 @@ Keep each section clear, actionable, and evidence-based."""
                 model=model_name,
                 contents=prompt
             )
-            return response.text if hasattr(response, 'text') else str(response)
+            result = response.text if hasattr(response, 'text') else str(response)
+            return result, f"Gemini ({model_name})"
         except Exception as e:
             last_error = e
             continue
     
     # If all models failed
     st.error(f'LLM generation failed with all models. Last error: {last_error}')
-    return None
+    return None, None
 
 
 def realtime_prediction_mode(model_obj, scaler_obj):
@@ -482,13 +513,22 @@ def realtime_prediction_mode(model_obj, scaler_obj):
     st.header('🔬 Real-time Tendinopathy Prediction')
     st.caption('Upload patient EventCycle data to get instant prediction with explainable AI')
     
-    # Gemini API key: try .env first, then sidebar input
-    env_key = os.getenv('GEMINI_API_KEY', '').strip()
-    if env_key:
-        gemini_key = env_key
-        st.sidebar.success('✓ Gemini API key loaded from .env')
+    # Groq API key: try .env first, then sidebar input (PRIMARY)
+    st.sidebar.subheader('🤖 AI Configuration')
+    groq_env_key = os.getenv('GROQ_API_KEY', '').strip()
+    if groq_env_key:
+        groq_key = groq_env_key
+        st.sidebar.success('✓ Groq API key loaded from .env (Primary)')
     else:
-        gemini_key = st.sidebar.text_input('Gemini API Key (for LLM explanations)', type='password', help='Get your key at https://makersuite.google.com/app/apikey or set GEMINI_API_KEY in .env file')
+        groq_key = st.sidebar.text_input('Groq API Key (Primary)', type='password', help='Get your key at https://console.groq.com/')
+    
+    # Gemini API key: try .env first, then sidebar input (FALLBACK)
+    gemini_env_key = os.getenv('GEMINI_API_KEY', '').strip()
+    if gemini_env_key:
+        gemini_key = gemini_env_key
+        st.sidebar.info('✓ Gemini API key loaded from .env (Fallback)')
+    else:
+        gemini_key = st.sidebar.text_input('Gemini API Key (Fallback)', type='password', help='Get your key at https://makersuite.google.com/app/apikey')
     
     uploaded = st.file_uploader('Upload EventCycle file (CSV or Excel)', type=['csv', 'xlsx', 'xls'], key='realtime')
     
@@ -579,14 +619,15 @@ def realtime_prediction_mode(model_obj, scaler_obj):
                     # 4️⃣ LLM Clinical Explanation
                     st.subheader('4️⃣ Comprehensive Clinical Report (AI-Generated)')
                     explanation = None
+                    api_used = None
                     if top_features is not None:
                         with st.spinner('🤖 Generating comprehensive clinical report with AI... This may take 10-20 seconds.'):
-                            explanation = generate_llm_explanation(pred_class, prob, top_features, trial_info, gemini_key)
+                            explanation, api_used = generate_llm_explanation(pred_class, prob, top_features, trial_info, groq_key, gemini_key)
                         if explanation:
-                            st.success('✅ Report generated successfully!')
+                            st.success(f'✅ Report generated successfully using {api_used}!')
                             st.markdown(explanation)
                         else:
-                            st.error('Failed to generate report. Please check your API key and try again.')
+                            st.error('Failed to generate report. Please check your API keys and try again.')
                     else:
                         st.warning('Cannot generate explanation without SHAP features')
                     
@@ -611,7 +652,10 @@ Top 10 Contributing Features (SHAP Analysis):
                             report_text += f"  {feat_row['feature']:25s} | SHAP: {feat_row['shap_value']:+.4f} | Importance: {feat_row['abs_shap']:.4f}\n"
                         
                         if explanation:
-                            report_text += f"\n\nCOMPREHENSIVE CLINICAL ANALYSIS:\n{'='*60}\n{explanation}\n"
+                            report_text += f"\n\nCOMPREHENSIVE CLINICAL ANALYSIS:\n{'='*60}\n"
+                            if api_used:
+                                report_text += f"(Generated using: {api_used})\n\n"
+                            report_text += f"{explanation}\n"
                         
                         report_text += f"\n\n{'='*60}\nReport Generated: {pd.Timestamp.now()}\n"
                         

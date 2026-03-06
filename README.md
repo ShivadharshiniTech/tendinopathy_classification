@@ -75,8 +75,19 @@ For **unlabeled** data (without condition labels) - get predictions with explain
    - **Prediction**: Normal vs Tendinopathy with confidence score
    - **SHAP Explanation**: Feature importance waterfall plot showing which features drove the prediction
    - **Pain Curve**: Visualization of pain progression over 101 event cycles
-   - **LLM Explanation**: Natural language clinical explanation powered by Google Gemini
-3. Optional: Enter Gemini API key in sidebar for AI-generated explanations
+   - **Comprehensive AI Report**: Detailed clinical analysis powered by Groq (Llama-3.1-70b) or Gemini (fallback)
+     - Clinical interpretation for healthcare professionals
+     - Feature explanations
+     - Movement phase analysis
+     - Rehabilitation suggestions
+     - Simple explanation for patients
+3. **Download Reports**: Get complete TXT report or key metrics CSV
+
+**AI API Keys (Optional for LLM Explanations):**
+- **Primary**: Groq API key from [Groq Console](https://console.groq.com/)
+- **Fallback**: Gemini API key from [Google AI Studio](https://makersuite.google.com/app/apikey)
+- Set in `.env` file or enter in sidebar
+- App automatically tries Groq first, then falls back to Gemini if unavailable
 
 #### 📊 Model Evaluation Mode
 For **labeled** data (with condition column) - test model performance:
@@ -87,11 +98,6 @@ For **labeled** data (with condition column) - test model performance:
 5. Live prediction simulator
 
 **Supported file formats:** CSV (.csv), Excel (.xlsx, .xls)
-
-**Getting a Gemini API Key:**
-1. Go to [Google AI Studio](https://makersuite.google.com/app/apikey)
-2. Click "Get API Key"
-3. Copy and paste into the sidebar (optional, only for LLM explanations)
 
 ## Features
 
