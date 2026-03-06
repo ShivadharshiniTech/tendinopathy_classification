@@ -26,7 +26,7 @@ except Exception:
     _HAS_SHAP = False
 
 try:
-    import google.generativeai as genai
+    from google import genai
     _HAS_GEMINI = True
 except Exception:
     _HAS_GEMINI = False
@@ -305,8 +305,8 @@ def plot_shap_explanation(model_obj, scaler_obj, features_df, idx=0):
     X = features_df[feature_names].iloc[[idx]]
     X_scaled = scaler.transform(X) if scaler is not None else X.values
     
-    # Create SHAP explainer
-    explainer = shap.LinearExplainer(model, X_scaled, feature_names=feature_names)
+    # Create SHAP explainer (use model directly for LogisticRegression)
+    explainer = shap.Explainer(model, X_scaled)
     shap_values = explainer(X_scaled)
     
     # Plot waterfall
@@ -370,27 +370,23 @@ def plot_pain_curve(raw_event_data, trial_info):
 def generate_llm_explanation(prediction, prob, top_features, trial_info, gemini_api_key=None):
     """Generate natural language explanation using Gemini LLM"""
     if not _HAS_GEMINI:
-        st.error('Google GenerativeAI not installed. Run: pip install google-generativeai')
+        st.error('Google GenAI not installed. Run: pip install google-genai')
         return None
     
     if gemini_api_key is None or gemini_api_key.strip() == '':
         st.warning('No Gemini API key provided. Enter your key in the sidebar.')
         return None
     
-    try:
-        genai.configure(api_key=gemini_api_key)
-        model = genai.GenerativeModel('gemini-pro')
-        
-        # Build prompt
-        condition = "Tendinopathy" if prediction == 1 else "Normal"
-        confidence = prob if prediction == 1 else (1 - prob)
-        
-        top_features_text = "\n".join([
-            f"- {row['feature']}: SHAP value = {row['shap_value']:.4f}"
-            for _, row in top_features.head(5).iterrows()
-        ])
-        
-        prompt = f"""You are a clinical biomechanics expert explaining tendinopathy classification results to a healthcare professional.
+    # Build prompt
+    condition = "Tendinopathy" if prediction == 1 else "Normal"
+    confidence = prob if prediction == 1 else (1 - prob)
+    
+    top_features_text = "\n".join([
+        f"- {row['feature']}: SHAP value = {row['shap_value']:.4f}"
+        for _, row in top_features.head(5).iterrows()
+    ])
+    
+    prompt = f"""You are a clinical biomechanics expert explaining tendinopathy classification results to a healthcare professional.
 
 **Model Prediction:**
 - Classification: {condition}
@@ -407,15 +403,36 @@ Write a clear, concise 3-4 sentence clinical explanation for this prediction. In
 1. The prediction and confidence level
 2. Which biomechanical features most influenced the decision
 3. What this means clinically (e.g., pain patterns, movement dynamics)
-
 Keep it professional but accessible to clinicians."""
 
-        response = model.generate_content(prompt)
-        return response.text
+    # Try multiple model names until one works
+    client = genai.Client(api_key=gemini_api_key)
     
-    except Exception as e:
-        st.error(f'LLM generation failed: {e}')
-        return None
+    model_names = [
+        'gemini-2-0-flash-exp',
+        'gemini-exp-1206',
+        'gemini-2-5-flash-preview',
+        'gemini-1-5-flash',
+        'gemini-1-5-pro',
+        'gemini-3-flash-preview'
+    ]
+    
+    last_error = None
+    
+    for model_name in model_names:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
+            return response.text if hasattr(response, 'text') else str(response)
+        except Exception as e:
+            last_error = e
+            continue
+    
+    # If all models failed
+    st.error(f'LLM generation failed with all models. Last error: {last_error}')
+    return None
 
 
 def realtime_prediction_mode(model_obj, scaler_obj):
@@ -497,55 +514,33 @@ def realtime_prediction_mode(model_obj, scaler_obj):
                     
                     # 2️⃣ SHAP Feature Importance
                     st.subheader('2️⃣ Feature Importance (SHAP)')
-                    if _HAS_SHAP:
+                    try:
                         top_features = plot_shap_explanation(model_obj, scaler_obj, features_df, idx)
-                        if top_features is not None:
-                            st.dataframe(top_features[['feature', 'shap_value']].head(10), hide_index=True)
-                    else:
-                        st.warning('Install SHAP for explainability: `pip install shap`')
+                    except Exception as e:
+                        st.error(f'SHAP explanation failed: {e}')
                         top_features = None
                     
-                    # 3️⃣ Pain Curve Visualization
-                    st.subheader('3️⃣ Pain Progression Curve')
-                    # Get raw event cycles for this trial
-                    trial_mask = (raw_df['Subject'] == subj) & (raw_df['Task'] == task) & (raw_df['Speed'] == speed)
-                    trial_data = raw_df[trial_mask]
+                    # 3️⃣ Pain Curve
+                    st.subheader('3️⃣ Pain Progression')
+                    try:
+                        # Get raw event data for this trial
+                        trial_raw = raw_df[
+                            (raw_df['Subject'] == subj) & 
+                            (raw_df['Task'] == task) & 
+                            (raw_df['Speed'] == speed)
+                        ].sort_values('EventCycle')
+                        plot_pain_curve(trial_raw, trial_info)
+                    except Exception as e:
+                        st.error(f'Pain curve visualization failed: {e}')
                     
-                    if len(trial_data) > 0:
-                        plot_pain_curve(trial_data, trial_info)
-                    else:
-                        st.warning('Could not find raw event cycle data for visualization')
-                    
-                    # 4️⃣ LLM Explanation
+                    # 4️⃣ LLM Clinical Explanation
                     st.subheader('4️⃣ Clinical Explanation (AI-Generated)')
-                    if _HAS_GEMINI and gemini_key and top_features is not None:
-                        with st.spinner('Generating explanation...'):
-                            explanation = generate_llm_explanation(pred_class, prob, top_features, trial_info, gemini_key)
-                            if explanation:
-                                st.info(explanation)
-                    elif not _HAS_GEMINI:
-                        st.warning('Install google-generativeai: `pip install google-generativeai`')
-                    elif not gemini_key:
-                        st.warning('Enter your Gemini API key in the sidebar for AI explanations')
-                    
-                    # Download individual report
-                    report_data = {
-                        'Trial': trial_info,
-                        'Prediction': 'Tendinopathy' if pred_class == 1 else 'Normal',
-                        'Confidence': f'{confidence*100:.1f}%',
-                        'Peak_Pain': row.get('peak_pain', 'N/A'),
-                        'Mean_Pain': row.get('mean_pain', 'N/A'),
-                        'Pain_Acceleration': row.get('pain_acceleration', 'N/A')
-                    }
-                    report_df = pd.DataFrame([report_data])
-                    csv = report_df.to_csv(index=False)
-                    st.download_button(
-                        'Download Prediction Report (CSV)',
-                        csv,
-                        f'prediction_{subj}_{task}_{speed}.csv',
-                        'text/csv',
-                        key=f'download_{idx}'
-                    )
+                    if top_features is not None:
+                        explanation = generate_llm_explanation(pred_class, prob, top_features, trial_info, gemini_key)
+                        if explanation:
+                            st.write(explanation)
+                    else:
+                        st.warning('Cannot generate explanation without SHAP features')
 
 
 def model_evaluation_mode(model_obj, scaler_obj):
