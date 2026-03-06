@@ -403,7 +403,7 @@ def generate_llm_explanation(prediction, prob, top_features, trial_info, gemini_
         for _, row in top_features.head(5).iterrows()
     ])
     
-    prompt = f"""You are a clinical biomechanics expert explaining tendinopathy classification results to a healthcare professional.
+    prompt = f"""You are a clinical biomechanics expert providing a comprehensive tendinopathy classification report.
 
 **Model Prediction:**
 - Classification: {condition}
@@ -416,11 +416,36 @@ def generate_llm_explanation(prediction, prob, top_features, trial_info, gemini_
 {top_features_text}
 
 **Task:**
-Write a clear, concise 3-4 sentence clinical explanation for this prediction. Include:
-1. The prediction and confidence level
-2. Which biomechanical features most influenced the decision
-3. What this means clinically (e.g., pain patterns, movement dynamics)
-Keep it professional but accessible to clinicians."""
+Provide a comprehensive analysis with the following sections:
+
+## 1. CLINICAL INTERPRETATION (for Healthcare Professionals)
+Provide a detailed clinical interpretation of this {condition} prediction with {confidence*100:.1f}% confidence. Explain what this means for patient assessment and diagnosis.
+
+## 2. FEATURE EXPLANATION
+Explain the top 3 biomechanical features that influenced this prediction:
+- What each feature measures (e.g., peak_pain, pain_acceleration)
+- Why high/low values of these features indicate tendinopathy or normal condition
+- The clinical relevance of each feature
+
+## 3. MOVEMENT PHASE ANALYSIS
+Analyze the pain patterns across different movement phases:
+- Early phase pain characteristics
+- Mid-phase pain behavior
+- Late phase pain progression
+- What these patterns suggest about tissue health
+
+## 4. REHABILITATION SUGGESTIONS (if Tendinopathy predicted)
+Provide evidence-based rehabilitation recommendations:
+- Activity modifications
+- Load management strategies
+- Progressive exercise considerations
+- When to seek further clinical evaluation
+(If Normal: suggest general maintenance strategies)
+
+## 5. SIMPLE EXPLANATION (for Patients/Non-Experts)
+Explain the results in simple, non-technical language that a patient without medical background can understand. Avoid jargon and use analogies where helpful.
+
+Keep each section clear, actionable, and evidence-based."""
 
     # Try multiple model names until one works
     client = genai.Client(api_key=gemini_api_key)
@@ -551,13 +576,72 @@ def realtime_prediction_mode(model_obj, scaler_obj):
                         st.error(f'Pain curve visualization failed: {e}')
                     
                     # 4️⃣ LLM Clinical Explanation
-                    st.subheader('4️⃣ Clinical Explanation (AI-Generated)')
+                    st.subheader('4️⃣ Comprehensive Clinical Report (AI-Generated)')
+                    explanation = None
                     if top_features is not None:
                         explanation = generate_llm_explanation(pred_class, prob, top_features, trial_info, gemini_key)
                         if explanation:
-                            st.write(explanation)
+                            st.markdown(explanation)
                     else:
                         st.warning('Cannot generate explanation without SHAP features')
+                    
+                    # 5️⃣ Download Report
+                    st.subheader('5️⃣ Download Report')
+                    if top_features is not None:
+                        # Build comprehensive report
+                        report_text = f"""TENDINOPATHY CLASSIFICATION REPORT
+{'='*60}
+
+Trial Information:
+{trial_info}
+
+Prediction Results:
+- Classification: {condition.replace('🔴 **', '').replace('🟢 **', '').replace('**', '')}
+- Confidence: {confidence*100:.1f}%
+- Probability (Tendinopathy): {prob:.3f}
+
+Top 10 Contributing Features (SHAP Analysis):
+"""
+                        for i, feat_row in top_features.iterrows():
+                            report_text += f"  {feat_row['feature']:25s} | SHAP: {feat_row['shap_value']:+.4f} | Importance: {feat_row['abs_shap']:.4f}\n"
+                        
+                        if explanation:
+                            report_text += f"\n\nCOMPREHENSIVE CLINICAL ANALYSIS:\n{'='*60}\n{explanation}\n"
+                        
+                        report_text += f"\n\n{'='*60}\nReport Generated: {pd.Timestamp.now()}\n"
+                        
+                        # Download button
+                        st.download_button(
+                            label='📥 Download Complete Report (TXT)',
+                            data=report_text,
+                            file_name=f'tendinopathy_report_{subj}_{task}_{speed}.txt',
+                            mime='text/plain',
+                            key=f'download_txt_{idx}'
+                        )
+                        
+                        # Also create CSV version with key data
+                        csv_data = pd.DataFrame([{
+                            'Subject': subj,
+                            'Task': task,
+                            'Speed': speed,
+                            'Prediction': condition.replace('🔴 **', '').replace('🟢 **', '').replace('**', ''),
+                            'Confidence': f'{confidence*100:.1f}%',
+                            'Prob_Tendinopathy': prob,
+                            'Top_Feature_1': top_features.iloc[0]['feature'] if len(top_features) > 0 else '',
+                            'Top_Feature_1_SHAP': top_features.iloc[0]['shap_value'] if len(top_features) > 0 else 0,
+                            'Top_Feature_2': top_features.iloc[1]['feature'] if len(top_features) > 1 else '',
+                            'Top_Feature_2_SHAP': top_features.iloc[1]['shap_value'] if len(top_features) > 1 else 0,
+                            'Top_Feature_3': top_features.iloc[2]['feature'] if len(top_features) > 2 else '',
+                            'Top_Feature_3_SHAP': top_features.iloc[2]['shap_value'] if len(top_features) > 2 else 0,
+                        }])
+                        
+                        st.download_button(
+                            label='📥 Download Key Metrics (CSV)',
+                            data=csv_data.to_csv(index=False),
+                            file_name=f'tendinopathy_metrics_{subj}_{task}_{speed}.csv',
+                            mime='text/csv',
+                            key=f'download_csv_{idx}'
+                        )
 
 
 def model_evaluation_mode(model_obj, scaler_obj):
