@@ -511,7 +511,7 @@ def realtime_prediction_mode(model_obj, scaler_obj):
             return
         
         # Extract temporal features
-        with st.spinner('Extracting temporal features...'):
+        with st.spinner('🔄 Extracting temporal features from event cycles...'):
             # Add dummy Condition for extraction function
             if 'Condition' not in raw_df.columns:
                 raw_df['Condition'] = 'unknown'
@@ -557,7 +557,8 @@ def realtime_prediction_mode(model_obj, scaler_obj):
                     # 2️⃣ SHAP Feature Importance
                     st.subheader('2️⃣ Feature Importance (SHAP)')
                     try:
-                        top_features = plot_shap_explanation(model_obj, scaler_obj, features_df, idx)
+                        with st.spinner('📊 Calculating feature importance...'):
+                            top_features = plot_shap_explanation(model_obj, scaler_obj, features_df, idx)
                     except Exception as e:
                         st.error(f'SHAP explanation failed: {e}')
                         top_features = None
@@ -579,9 +580,13 @@ def realtime_prediction_mode(model_obj, scaler_obj):
                     st.subheader('4️⃣ Comprehensive Clinical Report (AI-Generated)')
                     explanation = None
                     if top_features is not None:
-                        explanation = generate_llm_explanation(pred_class, prob, top_features, trial_info, gemini_key)
+                        with st.spinner('🤖 Generating comprehensive clinical report with AI... This may take 10-20 seconds.'):
+                            explanation = generate_llm_explanation(pred_class, prob, top_features, trial_info, gemini_key)
                         if explanation:
+                            st.success('✅ Report generated successfully!')
                             st.markdown(explanation)
+                        else:
+                            st.error('Failed to generate report. Please check your API key and try again.')
                     else:
                         st.warning('Cannot generate explanation without SHAP features')
                     
