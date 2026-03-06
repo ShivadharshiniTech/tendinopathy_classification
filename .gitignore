@@ -36,6 +36,7 @@ Thumbs.db
 # Data files
 dataset/
 data/
+test data/
 
 # Output folders (generated results and images)
 results/
@@ -44,3 +45,6 @@ experiments_C/
 
 # Logs
 *.log
+
+# Environment variables
+.env

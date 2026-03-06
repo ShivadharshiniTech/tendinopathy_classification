@@ -66,11 +66,32 @@ python compare_simple_models.py
 streamlit run app.py
 ```
 
-**The app now accepts two input formats:**
-1. **Raw Event-Cycle Data** (Recommended) - Upload your EventCycle CSV and the app automatically extracts temporal features
-2. **Pre-extracted Temporal Features** (Advanced) - Upload features CSV if you've already run `extract_temporal_features.py`
+**The app now has TWO modes:**
 
-Upload your data and get real-time tendinopathy predictions!
+#### 🔮 Real-time Prediction Mode
+For **unlabeled** data (without condition labels) - get predictions with explainability:
+1. Upload raw EventCycle data (CSV or Excel with 101 cycles)
+2. For each trial, see:
+   - **Prediction**: Normal vs Tendinopathy with confidence score
+   - **SHAP Explanation**: Feature importance waterfall plot showing which features drove the prediction
+   - **Pain Curve**: Visualization of pain progression over 101 event cycles
+   - **LLM Explanation**: Natural language clinical explanation powered by Google Gemini
+3. Optional: Enter Gemini API key in sidebar for AI-generated explanations
+
+#### 📊 Model Evaluation Mode
+For **labeled** data (with condition column) - test model performance:
+1. Upload raw Event-Cycle data or pre-extracted temporal features
+2. See predictions with key features
+3. View performance metrics (accuracy, precision, recall, F1, AUC)
+4. Interactive confusion matrix and ROC/PR curves
+5. Live prediction simulator
+
+**Supported file formats:** CSV (.csv), Excel (.xlsx, .xls)
+
+**Getting a Gemini API Key:**
+1. Go to [Google AI Studio](https://makersuite.google.com/app/apikey)
+2. Click "Get API Key"
+3. Copy and paste into the sidebar (optional, only for LLM explanations)
 
 ## Features
 

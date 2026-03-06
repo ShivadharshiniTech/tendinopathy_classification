@@ -4,6 +4,11 @@ import time
 from pathlib import Path
 import pandas as pd
 import numpy as np
+import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 try:
     import plotly.express as px
@@ -13,6 +18,18 @@ except Exception:
     px = None
     go = None
     _HAS_PLOTLY = False
+
+try:
+    import shap
+    _HAS_SHAP = True
+except Exception:
+    _HAS_SHAP = False
+
+try:
+    import google.generativeai as genai
+    _HAS_GEMINI = True
+except Exception:
+    _HAS_GEMINI = False
 
 from utils import load_temporal_features
 from sklearn.metrics import (
@@ -26,6 +43,18 @@ from sklearn.metrics import (
     roc_curve,
     brier_score_loss,
 )
+
+
+def read_uploaded_file(uploaded_file):
+    """Read CSV or Excel file from uploaded file object"""
+    filename = uploaded_file.name.lower()
+    
+    if filename.endswith('.csv'):
+        return pd.read_csv(uploaded_file)
+    elif filename.endswith(('.xlsx', '.xls')):
+        return pd.read_excel(uploaded_file)
+    else:
+        raise ValueError(f'Unsupported file format. Please upload CSV or Excel (.xlsx, .xls) files.')
 
 
 def extract_temporal_features_from_eventcycle(event_df):
@@ -143,7 +172,7 @@ def predict_df(model_obj, scaler_obj, df, prob_col_name='prob_tendinopathy'):
 
 
 @st.cache_resource
-def load_test_results(path='test_results_temporal.csv'):
+def load_test_results(path='results/test_results_temporal.csv'):
     p = Path(path)
     if not p.exists():
         return None
@@ -257,38 +286,283 @@ def evaluation_panel(df):
     st.dataframe(df.head())
 
 
-def main():
-    st.title('Tendinopathy Classifier — Temporal Features Model')
-
-    st.sidebar.header('Model')
-    model_obj = load_saved_model('model_temporal.joblib')
-    scaler_obj = load_saved_scaler('scaler_temporal.joblib')
+def plot_shap_explanation(model_obj, scaler_obj, features_df, idx=0):
+    """Generate SHAP waterfall plot for a single prediction"""
+    if not _HAS_SHAP:
+        st.error('SHAP not installed. Run: pip install shap')
+        return None
     
-    if model_obj is None:
-        st.sidebar.warning('No model_temporal.joblib found. Run `train_temporal_model.py` first.')
+    model = model_obj['model']
+    feature_names = model_obj['features']
+    
+    # Get scaler
+    if 'scaler' in model_obj:
+        scaler = model_obj['scaler']
     else:
-        st.sidebar.success('✓ Loaded temporal features model')
-        st.sidebar.info(f'Features: {len(model_obj["features"])} temporal features')
-        st.sidebar.caption('Model: Logistic Regression with L2 regularization')
+        scaler = scaler_obj
+    
+    # Prepare data
+    X = features_df[feature_names].iloc[[idx]]
+    X_scaled = scaler.transform(X) if scaler is not None else X.values
+    
+    # Create SHAP explainer
+    explainer = shap.LinearExplainer(model, X_scaled, feature_names=feature_names)
+    shap_values = explainer(X_scaled)
+    
+    # Plot waterfall
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(10, 6))
+    shap.plots.waterfall(shap_values[0], show=False)
+    st.pyplot(fig, clear_figure=True)
+    plt.close()
+    
+    # Return top features
+    shap_vals = shap_values.values[0]
+    top_features = pd.DataFrame({
+        'feature': feature_names,
+        'shap_value': shap_vals,
+        'abs_shap': np.abs(shap_vals)
+    }).sort_values('abs_shap', ascending=False).head(10)
+    
+    return top_features
+
+
+def plot_pain_curve(raw_event_data, trial_info):
+    """Plot pain vs event cycle"""
+    if not _HAS_PLOTLY:
+        st.error('Plotly not installed. Run: pip install plotly')
+        return
+    
+    pain_values = raw_event_data['Pain_pred'].values
+    cycles = range(len(pain_values))
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=list(cycles), 
+        y=pain_values,
+        mode='lines+markers',
+        name='Pain',
+        line=dict(color='#FF6B6B', width=2),
+        marker=dict(size=4)
+    ))
+    
+    # Add peak pain marker
+    peak_idx = np.argmax(pain_values)
+    fig.add_trace(go.Scatter(
+        x=[peak_idx],
+        y=[pain_values[peak_idx]],
+        mode='markers',
+        name='Peak Pain',
+        marker=dict(size=12, color='red', symbol='star')
+    ))
+    
+    fig.update_layout(
+        title=f"Pain Progression - {trial_info}",
+        xaxis_title="Event Cycle",
+        yaxis_title="Pain Prediction Value",
+        height=400,
+        hovermode='x unified'
+    )
+    
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def generate_llm_explanation(prediction, prob, top_features, trial_info, gemini_api_key=None):
+    """Generate natural language explanation using Gemini LLM"""
+    if not _HAS_GEMINI:
+        st.error('Google GenerativeAI not installed. Run: pip install google-generativeai')
+        return None
+    
+    if gemini_api_key is None or gemini_api_key.strip() == '':
+        st.warning('No Gemini API key provided. Enter your key in the sidebar.')
+        return None
+    
+    try:
+        genai.configure(api_key=gemini_api_key)
+        model = genai.GenerativeModel('gemini-pro')
         
-        # Check if scaler is in model or needs separate file
-        if 'scaler' in model_obj:
-            st.sidebar.success('✓ Feature scaler included in model')
-        elif scaler_obj is not None:
-            st.sidebar.success('✓ Loaded feature scaler (legacy format)')
-        else:
-            st.sidebar.warning('⚠ No scaler found. Predictions may be incorrect!')
+        # Build prompt
+        condition = "Tendinopathy" if prediction == 1 else "Normal"
+        confidence = prob if prediction == 1 else (1 - prob)
+        
+        top_features_text = "\n".join([
+            f"- {row['feature']}: SHAP value = {row['shap_value']:.4f}"
+            for _, row in top_features.head(5).iterrows()
+        ])
+        
+        prompt = f"""You are a clinical biomechanics expert explaining tendinopathy classification results to a healthcare professional.
+
+**Model Prediction:**
+- Classification: {condition}
+- Confidence: {confidence*100:.1f}%
+
+**Trial Information:**
+{trial_info}
+
+**Top Contributing Features (SHAP values):**
+{top_features_text}
+
+**Task:**
+Write a clear, concise 3-4 sentence clinical explanation for this prediction. Include:
+1. The prediction and confidence level
+2. Which biomechanical features most influenced the decision
+3. What this means clinically (e.g., pain patterns, movement dynamics)
+
+Keep it professional but accessible to clinicians."""
+
+        response = model.generate_content(prompt)
+        return response.text
+    
+    except Exception as e:
+        st.error(f'LLM generation failed: {e}')
+        return None
+
+
+def realtime_prediction_mode(model_obj, scaler_obj):
+    """Real-time prediction mode for unlabeled data"""
+    st.header('🔬 Real-time Tendinopathy Prediction')
+    st.caption('Upload patient EventCycle data to get instant prediction with explainable AI')
+    
+    # Gemini API key: try .env first, then sidebar input
+    env_key = os.getenv('GEMINI_API_KEY', '').strip()
+    if env_key:
+        gemini_key = env_key
+        st.sidebar.success('✓ Gemini API key loaded from .env')
+    else:
+        gemini_key = st.sidebar.text_input('Gemini API Key (for LLM explanations)', type='password', help='Get your key at https://makersuite.google.com/app/apikey or set GEMINI_API_KEY in .env file')
+    
+    uploaded = st.file_uploader('Upload EventCycle file (CSV or Excel)', type=['csv', 'xlsx', 'xls'], key='realtime')
+    
+    if uploaded is not None:
+        try:
+            raw_df = read_uploaded_file(uploaded)
+        except Exception as e:
+            st.error(f'Failed to read file: {e}')
+            return
+        
+        st.write(f'**Loaded:** {len(raw_df)} event cycles')
+        
+        # Validate required columns
+        required_cols = ['Subject', 'Task', 'Speed', 'Pain_pred']
+        missing = [c for c in required_cols if c not in raw_df.columns]
+        
+        if missing:
+            st.error(f'Missing required columns: {missing}')
+            st.info('Required: Subject, Task, Speed, EventCycle, Pain_pred')
+            return
+        
+        # Extract temporal features
+        with st.spinner('Extracting temporal features...'):
+            # Add dummy Condition for extraction function
+            if 'Condition' not in raw_df.columns:
+                raw_df['Condition'] = 'unknown'
+            features_df = extract_temporal_features_from_eventcycle(raw_df)
+        
+        if len(features_df) == 0:
+            st.error('No trials extracted. Check your data format.')
+            return
+        
+        # Predict
+        if model_obj is not None:
+            for f in model_obj['features']:
+                if f not in features_df.columns:
+                    features_df[f] = 0
+            
+            preds = predict_df(model_obj, scaler_obj, features_df)
+            
+            # Display each trial
+            for idx, row in preds.iterrows():
+                with st.container():
+                    st.markdown('---')
+                    
+                    # Trial info
+                    subj = row.get('Subject', 'Unknown')
+                    task = row.get('Task', 'Unknown')
+                    speed = row.get('Speed', 'Unknown')
+                    trial_info = f"Subject {subj}, Task: {task}, Speed: {speed}"
+                    
+                    st.subheader(f"Trial: {trial_info}")
+                    
+                    # 1️⃣ Prediction
+                    prob = row['prob_tendinopathy']
+                    pred_class = int(row['pred_tendinopathy'])
+                    condition = "🔴 **Tendinopathy**" if pred_class == 1 else "🟢 **Normal**"
+                    confidence = prob if pred_class == 1 else (1 - prob)
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric('Prediction', condition)
+                    with col2:
+                        st.metric('Confidence', f'{confidence*100:.1f}%')
+                    
+                    # 2️⃣ SHAP Feature Importance
+                    st.subheader('2️⃣ Feature Importance (SHAP)')
+                    if _HAS_SHAP:
+                        top_features = plot_shap_explanation(model_obj, scaler_obj, features_df, idx)
+                        if top_features is not None:
+                            st.dataframe(top_features[['feature', 'shap_value']].head(10), hide_index=True)
+                    else:
+                        st.warning('Install SHAP for explainability: `pip install shap`')
+                        top_features = None
+                    
+                    # 3️⃣ Pain Curve Visualization
+                    st.subheader('3️⃣ Pain Progression Curve')
+                    # Get raw event cycles for this trial
+                    trial_mask = (raw_df['Subject'] == subj) & (raw_df['Task'] == task) & (raw_df['Speed'] == speed)
+                    trial_data = raw_df[trial_mask]
+                    
+                    if len(trial_data) > 0:
+                        plot_pain_curve(trial_data, trial_info)
+                    else:
+                        st.warning('Could not find raw event cycle data for visualization')
+                    
+                    # 4️⃣ LLM Explanation
+                    st.subheader('4️⃣ Clinical Explanation (AI-Generated)')
+                    if _HAS_GEMINI and gemini_key and top_features is not None:
+                        with st.spinner('Generating explanation...'):
+                            explanation = generate_llm_explanation(pred_class, prob, top_features, trial_info, gemini_key)
+                            if explanation:
+                                st.info(explanation)
+                    elif not _HAS_GEMINI:
+                        st.warning('Install google-generativeai: `pip install google-generativeai`')
+                    elif not gemini_key:
+                        st.warning('Enter your Gemini API key in the sidebar for AI explanations')
+                    
+                    # Download individual report
+                    report_data = {
+                        'Trial': trial_info,
+                        'Prediction': 'Tendinopathy' if pred_class == 1 else 'Normal',
+                        'Confidence': f'{confidence*100:.1f}%',
+                        'Peak_Pain': row.get('peak_pain', 'N/A'),
+                        'Mean_Pain': row.get('mean_pain', 'N/A'),
+                        'Pain_Acceleration': row.get('pain_acceleration', 'N/A')
+                    }
+                    report_df = pd.DataFrame([report_data])
+                    csv = report_df.to_csv(index=False)
+                    st.download_button(
+                        'Download Prediction Report (CSV)',
+                        csv,
+                        f'prediction_{subj}_{task}_{speed}.csv',
+                        'text/csv',
+                        key=f'download_{idx}'
+                    )
+
+
+def model_evaluation_mode(model_obj, scaler_obj):
+    """Model evaluation mode with labeled data (current functionality)"""
+    st.header('📊 Model Evaluation & Testing')
+    st.caption('Upload data WITH condition labels to evaluate model performance')
 
     st.header('1) Upload Raw Event-Cycle Data (Recommended)')
     st.caption('Upload your raw EventCycle CSV with columns: Subject, Condition, Task, Speed, EventCycle, Pain_pred. The app will automatically extract temporal features and predict.')
     
-    uploaded_raw = st.file_uploader('Upload EventCycle CSV', type=['csv'], key='raw_upload')
+    uploaded_raw = st.file_uploader('Upload EventCycle file (CSV or Excel)', type=['csv', 'xlsx', 'xls'], key='raw_upload')
 
     if uploaded_raw is not None:
         try:
-            raw_df = pd.read_csv(uploaded_raw)
+            raw_df = read_uploaded_file(uploaded_raw)
         except Exception as e:
-            st.error(f'Failed to read CSV: {e}')
+            st.error(f'Failed to read file: {e}')
             return
 
         st.write('**Raw data loaded:**', len(raw_df), 'rows')
@@ -373,14 +647,14 @@ def main():
             )
 
     st.header('2) Upload Temporal Features Data (Advanced)')
-    st.caption('Upload a CSV with 23 temporal features extracted from EventCycle data. Use extract_temporal_features.py to generate this from raw EventCycle CSV.')
-    uploaded = st.file_uploader('Upload temporal features CSV', type=['csv'])
+    st.caption('Upload a file with 23 temporal features extracted from EventCycle data. Use extract_temporal_features.py to generate this from raw EventCycle CSV/Excel.')
+    uploaded = st.file_uploader('Upload temporal features file (CSV or Excel)', type=['csv', 'xlsx', 'xls'])
 
     if uploaded is not None:
         try:
-            data_df = pd.read_csv(uploaded)
+            data_df = read_uploaded_file(uploaded)
         except Exception as e:
-            st.error(f'Failed to read CSV: {e}')
+            st.error(f'Failed to read file: {e}')
             return
 
         st.write('Rows:', len(data_df))
@@ -454,13 +728,13 @@ def main():
                     pass
 
     st.header('3) Live Replay Simulator')
-    st.caption('Upload temporal features CSV to replay predictions row-by-row.')
-    sim_file = st.file_uploader('Upload temporal features CSV', type=['csv'], key='sim')
+    st.caption('Upload temporal features file to replay predictions row-by-row.')
+    sim_file = st.file_uploader('Upload temporal features file (CSV or Excel)', type=['csv', 'xlsx', 'xls'], key='sim')
     if sim_file is not None:
         try:
-            sim_df = pd.read_csv(sim_file)
+            sim_df = read_uploaded_file(sim_file)
         except Exception as e:
-            st.error(f'Failed to read CSV: {e}')
+            st.error(f'Failed to read file: {e}')
             return
         start = st.button('Start simulation')
         if start:
@@ -505,26 +779,67 @@ def main():
                 time.sleep(0.6)
 
     st.header('4) Model Evaluation (Interactive)')
-    st.write('Load the `test_results_temporal.csv` from training, or upload your own test CSV with `true_label` and `prob`/`pred` columns.')
+    st.write('Load the `test_results_temporal.csv` from training, or upload your own test file with `true_label` and `prob`/`pred` columns.')
 
     # Option to load bundled test_results_temporal.csv or upload
     col1, col2 = st.columns([1, 2])
     with col1:
         if st.button('Load test_results_temporal.csv'):
-            test_df = load_test_results('test_results_temporal.csv')
+            test_df = load_test_results('results/test_results_temporal.csv')
         else:
             test_df = None
     with col2:
-        uploaded_test = st.file_uploader('Or upload test CSV', type=['csv'], key='test_upload')
+        uploaded_test = st.file_uploader('Or upload test file (CSV or Excel)', type=['csv', 'xlsx', 'xls'], key='test_upload')
         if uploaded_test is not None:
             try:
-                test_df = pd.read_csv(uploaded_test)
+                test_df = read_uploaded_file(uploaded_test)
             except Exception as e:
-                st.error(f'Failed to read uploaded test CSV: {e}')
+                st.error(f'Failed to read uploaded test file: {e}')
                 test_df = None
 
     if test_df is not None:
         evaluation_panel(test_df)
+
+
+def main():
+    """Main function with sidebar mode selector"""
+    st.set_page_config(page_title='Tendinopathy Classifier', page_icon='🏥', layout='wide')
+    
+    # Sidebar: Mode selection
+    st.sidebar.title('🏥 Tendinopathy Classifier')
+    mode = st.sidebar.radio(
+        'Select Mode',
+        ['Real-time Prediction', 'Model Evaluation'],
+        help='**Real-time**: Predict on unlabeled data with SHAP explainability and LLM insights\n\n**Evaluation**: Test model performance on labeled data'
+    )
+    
+    # Load model once
+    st.sidebar.header('Model Status')
+    model_obj = load_saved_model('model_temporal.joblib')
+    scaler_obj = load_saved_scaler('scaler_temporal.joblib')
+    
+    if model_obj is None:
+        st.sidebar.error('❌ No model found')
+        st.error('Model file `model_temporal.joblib` not found. Run `train_temporal_model.py` first.')
+        return
+    else:
+        st.sidebar.success('✓ Model loaded')
+        st.sidebar.info(f'Features: {len(model_obj["features"])} temporal features')
+        st.sidebar.caption('Model: Logistic Regression with L2 regularization')
+        
+        # Check scaler
+        if 'scaler' in model_obj:
+            st.sidebar.success('✓ Scaler included')
+        elif scaler_obj is not None:
+            st.sidebar.success('✓ Scaler loaded (legacy)')
+        else:
+            st.sidebar.warning('⚠ No scaler found')
+    
+    # Route to appropriate mode
+    if mode == 'Real-time Prediction':
+        realtime_prediction_mode(model_obj, scaler_obj)
+    else:
+        model_evaluation_mode(model_obj, scaler_obj)
 
 
 if __name__ == '__main__':
