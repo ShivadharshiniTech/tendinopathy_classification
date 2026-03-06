@@ -66,6 +66,12 @@ python compare_simple_models.py
 streamlit run app.py
 ```
 
+**The app now accepts two input formats:**
+1. **Raw Event-Cycle Data** (Recommended) - Upload your EventCycle CSV and the app automatically extracts temporal features
+2. **Pre-extracted Temporal Features** (Advanced) - Upload features CSV if you've already run `extract_temporal_features.py`
+
+Upload your data and get real-time tendinopathy predictions!
+
 ## Features
 
 - **Temporal Feature Extraction**: 23 features including peak pain, pain slope, curvature, early/mid/late pain, statistical moments

@@ -28,6 +28,78 @@ from sklearn.metrics import (
 )
 
 
+def extract_temporal_features_from_eventcycle(event_df):
+    """Extract temporal features from raw event-cycle data
+    
+    Args:
+        event_df: DataFrame with columns: Subject, Condition, Task, Speed, EventCycle, Pain_pred
+        
+    Returns:
+        DataFrame with extracted temporal features for each trial
+    """
+    trials = []
+    
+    for (subj, cond, task, speed), group in event_df.groupby(
+        ['Subject', 'Condition', 'Task', 'Speed']
+    ):
+        pain = group['Pain_pred'].values
+        
+        # Basic statistics
+        features = {
+            'Subject': subj,
+            'Condition': cond,
+            'Task': task,
+            'Speed': speed,
+            
+            # Central tendency
+            'peak_pain': np.max(pain),
+            'mean_pain': np.mean(pain),
+            'median_pain': np.median(pain),
+            'min_pain': np.min(pain),
+            
+            # Dispersion
+            'std_pain': np.std(pain),
+            'pain_range': np.max(pain) - np.min(pain),
+            'pain_cv': np.std(pain) / np.mean(pain) if np.mean(pain) > 0 else 0,
+            'iqr_pain': np.percentile(pain, 75) - np.percentile(pain, 25),
+            
+            # Percentiles
+            'percentile_95': np.percentile(pain, 95),
+            'percentile_75': np.percentile(pain, 75),
+            'percentile_25': np.percentile(pain, 25),
+            'percentile_5': np.percentile(pain, 5),
+            
+            # Temporal dynamics
+            'time_to_peak': np.argmax(pain) / len(pain) if len(pain) > 0 else 0,
+            'pain_slope': np.polyfit(range(len(pain)), pain, 1)[0] if len(pain) > 1 else 0,
+            'pain_curvature': np.polyfit(range(len(pain)), pain, 2)[0] if len(pain) > 2 else 0,
+            
+            # Phase-based
+            'early_pain': np.mean(pain[:len(pain)//3]) if len(pain) >= 3 else np.mean(pain),
+            'mid_pain': np.mean(pain[len(pain)//3:2*len(pain)//3]) if len(pain) >= 3 else np.mean(pain),
+            'late_pain': np.mean(pain[2*len(pain)//3:]) if len(pain) >= 3 else np.mean(pain),
+            
+            # Derived metrics
+            'pain_acceleration': np.mean(np.diff(np.diff(pain))) if len(pain) > 2 else 0,
+            'pain_skewness': pd.Series(pain).skew(),
+            'pain_kurtosis': pd.Series(pain).kurtosis(),
+            
+            # Onset/offset
+            'onset_rate': (pain[10] - pain[0]) / 10 if len(pain) > 10 else 0,
+            'offset_rate': (pain[-1] - pain[-10]) / 10 if len(pain) > 10 else 0,
+        }
+        
+        trials.append(features)
+    
+    features_df = pd.DataFrame(trials)
+    
+    # Add target label if Condition is present
+    if 'Condition' in features_df.columns:
+        features_df['true_label'] = (features_df['Condition'].str.lower().str.contains('tend')).astype(int)
+    
+    return features_df
+
+
 @st.cache_resource
 def load_saved_model(path='model_temporal.joblib'):
     p = Path(path)
@@ -207,7 +279,100 @@ def main():
         else:
             st.sidebar.warning('⚠ No scaler found. Predictions may be incorrect!')
 
-    st.header('1) Upload Temporal Features Data')
+    st.header('1) Upload Raw Event-Cycle Data (Recommended)')
+    st.caption('Upload your raw EventCycle CSV with columns: Subject, Condition, Task, Speed, EventCycle, Pain_pred. The app will automatically extract temporal features and predict.')
+    
+    uploaded_raw = st.file_uploader('Upload EventCycle CSV', type=['csv'], key='raw_upload')
+
+    if uploaded_raw is not None:
+        try:
+            raw_df = pd.read_csv(uploaded_raw)
+        except Exception as e:
+            st.error(f'Failed to read CSV: {e}')
+            return
+
+        st.write('**Raw data loaded:**', len(raw_df), 'rows')
+        st.dataframe(raw_df.head())
+
+        # Validate required columns
+        required_cols = ['Subject', 'Condition', 'Task', 'Speed', 'Pain_pred']
+        missing = [c for c in required_cols if c not in raw_df.columns]
+        
+        if missing:
+            st.error(f'Missing required columns: {missing}')
+            st.info('Expected columns: Subject, Condition, Task, Speed, EventCycle, Pain_pred')
+            return
+
+        # Extract temporal features
+        with st.spinner('Extracting temporal features...'):
+            features_df = extract_temporal_features_from_eventcycle(raw_df)
+        
+        st.success(f'✓ Extracted features for {len(features_df)} trials')
+        st.dataframe(features_df.head())
+
+        if model_obj is not None:
+            # Ensure model feature columns exist
+            for f in model_obj['features']:
+                if f not in features_df.columns:
+                    st.warning(f'Model expects feature `{f}` but it is missing. Filling with 0.')
+                    features_df[f] = 0
+
+            preds = predict_df(model_obj, scaler_obj, features_df)
+            st.subheader('Predictions')
+            
+            # Build output columns
+            cols = ['Subject', 'Condition', 'Task', 'Speed']
+            
+            # Check if true labels exist
+            has_true_label = 'true_label' in preds.columns
+            
+            if has_true_label:
+                cols += ['true_label']
+            
+            cols += ['prob_tendinopathy', 'pred_tendinopathy']
+            
+            # Add key features
+            key_features = ['peak_pain', 'mean_pain', 'pain_acceleration', 'time_to_peak']
+            for feat in key_features:
+                if feat in preds.columns and feat not in cols:
+                    cols.append(feat)
+            
+            st.dataframe(preds[cols])
+            
+            # Show metrics if true labels are present
+            if has_true_label:
+                st.subheader('Performance Metrics')
+                y_true = preds['true_label'].astype(int).values
+                y_prob = preds['prob_tendinopathy'].values
+                y_pred = preds['pred_tendinopathy'].astype(int).values
+                
+                acc = accuracy_score(y_true, y_pred)
+                prec = precision_score(y_true, y_pred, zero_division=0)
+                rec = recall_score(y_true, y_pred, zero_division=0)
+                f1 = f1_score(y_true, y_pred, zero_division=0)
+                
+                cols_metric = st.columns(4)
+                cols_metric[0].metric('Accuracy', f'{acc:.3f}')
+                cols_metric[1].metric('Precision', f'{prec:.3f}')
+                cols_metric[2].metric('Recall', f'{rec:.3f}')
+                cols_metric[3].metric('F1 Score', f'{f1:.3f}')
+                
+                try:
+                    auc = roc_auc_score(y_true, y_prob)
+                    st.write(f'**ROC AUC:** {auc:.3f}')
+                except Exception:
+                    pass
+            
+            # Download predictions
+            csv_output = preds[cols].to_csv(index=False)
+            st.download_button(
+                label='Download predictions as CSV',
+                data=csv_output,
+                file_name='tendinopathy_predictions.csv',
+                mime='text/csv'
+            )
+
+    st.header('2) Upload Temporal Features Data (Advanced)')
     st.caption('Upload a CSV with 23 temporal features extracted from EventCycle data. Use extract_temporal_features.py to generate this from raw EventCycle CSV.')
     uploaded = st.file_uploader('Upload temporal features CSV', type=['csv'])
 
@@ -288,7 +453,7 @@ def main():
                 except Exception:
                     pass
 
-    st.header('2) Live Replay Simulator')
+    st.header('3) Live Replay Simulator')
     st.caption('Upload temporal features CSV to replay predictions row-by-row.')
     sim_file = st.file_uploader('Upload temporal features CSV', type=['csv'], key='sim')
     if sim_file is not None:
@@ -339,7 +504,7 @@ def main():
                 placeholder.write(text)
                 time.sleep(0.6)
 
-    st.header('3) Model Evaluation (Interactive)')
+    st.header('4) Model Evaluation (Interactive)')
     st.write('Load the `test_results_temporal.csv` from training, or upload your own test CSV with `true_label` and `prob`/`pred` columns.')
 
     # Option to load bundled test_results_temporal.csv or upload
