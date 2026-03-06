@@ -17,7 +17,10 @@ from sklearn.metrics import (
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-OUT_DIR = Path('.')
+RESULTS_DIR = Path('results')
+IMAGES_DIR = Path('images')
+RESULTS_DIR.mkdir(exist_ok=True)
+IMAGES_DIR.mkdir(exist_ok=True)
 TEST_SIZE = 0.25
 RANDOM_STATE = 42
 
@@ -45,8 +48,6 @@ models = {
 }
 
 results = {}
-
-os.makedirs(OUT_DIR, exist_ok=True)
 
 for name, model in models.items():
     print(f"Training {name}...")
@@ -107,11 +108,11 @@ for name, model in models.items():
         plt.savefig(fname, dpi=150)
         plt.close()
 
-    save_cm(m_train['confusion_matrix'], f'{name} - Train Confusion Matrix', OUT_DIR / f'cm_{name}_train.png')
-    save_cm(m_test['confusion_matrix'], f'{name} - Test Confusion Matrix', OUT_DIR / f'cm_{name}_test.png')
+    save_cm(m_train['confusion_matrix'], f'{name} - Train Confusion Matrix', IMAGES_DIR / f'cm_{name}_train.png')
+    save_cm(m_test['confusion_matrix'], f'{name} - Test Confusion Matrix', IMAGES_DIR / f'cm_{name}_test.png')
 
 # Save results
-with open(OUT_DIR / 'metrics_simple_models.json', 'w') as f:
+with open(RESULTS_DIR / 'metrics_simple_models.json', 'w') as f:
     json.dump(results, f, indent=2)
 
 # Also produce a CSV summary
@@ -131,5 +132,6 @@ for name, val in results.items():
             'brier': m['brier']
         })
 
-pd.DataFrame(rows).to_csv(OUT_DIR / 'metrics_simple_models.csv', index=False)
-print('Done. Metrics saved to metrics_simple_models.json and metrics_simple_models.csv; confusion images saved as cm_<model>_<split>.png')
+pd.DataFrame(rows).to_csv(RESULTS_DIR / 'metrics_simple_models.csv', index=False)
+print('Done. Metrics saved to results/metrics_simple_models.json and results/metrics_simple_models.csv')
+print('Confusion matrix images saved to images/ folder')

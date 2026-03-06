@@ -73,12 +73,18 @@ m_train = metrics(y_train, pred_train, proba_train)
 m_test = metrics(y_test, pred_test, proba_test)
 
 import json
+from pathlib import Path
+
+# Create results directory
+results_dir = Path('results')
+results_dir.mkdir(exist_ok=True)
+
 out = {'train': m_train, 'test': m_test, 'features': FEATURES}
-with open('metrics_temporal.json','w') as f:
+with open(results_dir / 'metrics_temporal.json','w') as f:
     json.dump(out, f, indent=2)
 
 print('Train metrics:')
 print(json.dumps(m_train, indent=2))
 print('\nTest metrics:')
 print(json.dumps(m_test, indent=2))
-print('\nArtifacts saved to metrics_temporal.json')
+print('\nArtifacts saved to results/metrics_temporal.json')

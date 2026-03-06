@@ -29,23 +29,18 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Model files
-*.joblib
-*.pkl
-*.h5
-*.pth
+# Model files (keep trained models in repo for now)
+# *.joblib
+# *.pkl
 
 # Data files
 dataset/
 data/
 
-# Output files
-test_results.csv
-predictions.csv
-*.log
+# Output folders (generated results and images)
+results/
+images/
+experiments_C/
 
-# Temporary files
-debug_csv.py
-analyze_*.py
-count_*.py
-make_*.py
+# Logs
+*.log

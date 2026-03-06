@@ -1,41 +1,83 @@
-# Tendinopathy classification demo
+# Tendinopathy Classification Demo
 
+This repository contains a complete pipeline for classifying tendinopathy using temporal biomechanical features extracted from event-cycle pain data.
 
-This repository contains a minimal pipeline and Streamlit demo to classify tendinopathy using each row as an independent observation (each row = one measurement/observation).
+## Project Structure
 
-Files in this repo:
-- `utils.py` — helpers to read CSVs and extract pain features when needed.
-- `train_and_save_model.py` — trains a Random Forest baseline using a stratified train/test split (rows treated independently) and saves `model.joblib` and test predictions.
-- `app.py` — Streamlit demo: upload CSVs, predict, and simulate CSV replay.
-- `requirements.txt` — Python dependencies.
+```
+├── dataset/                          # Input data (gitignored)
+├── results/                          # Model metrics and test results
+│   ├── metrics_simple_models.csv
+│   ├── metrics_simple_models.json
+│   ├── metrics_temporal.json
+│   ├── test_results_temporal.csv
+│   └── test_set_temporal.csv
+├── images/                           # Confusion matrices and plots
+│   ├── cm_<model>_train.png
+│   ├── cm_<model>_test.png
+│   └── learning_curve.png
+├── extract_temporal_features.py     # Extract 23 temporal features from event-cycle data
+├── train_temporal_model.py          # Train model on temporal features (Logistic Regression)
+├── compare_simple_models.py         # Compare KNN, Decision Tree, Naive Bayes, LDA, Logistic
+├── compute_temporal_metrics.py      # Compute metrics from saved model
+├── app.py                           # Streamlit demo app
+├── utils.py                         # Helper functions for CSV loading
+├── model_temporal.joblib            # Trained model + scaler + features
+├── scaler_temporal.joblib           # Scaler (for backward compatibility)
+├── requirements.txt                 # Python dependencies
+└── README.md                        # This file
+```
 
-Quick start
+## Quick Start
 
-1. Create a virtual environment and install requirements:
+### 1. Setup Environment
 
 ```bash
-python -m venv .venv
-.venv\Scripts\activate
+python -m venv venv
+venv\Scripts\activate  # Windows
 pip install -r requirements.txt
 ```
 
-2. Train a model using a CSV where each row is one observation (must contain `Condition` column):
+### 2. Extract Temporal Features
 
 ```bash
-python train_and_save_model.py --summary "dataset/PainModel_Summary_AllSubjects_2 (1).csv" --out model.joblib --test-out test_results.csv --test-size 0.2
+python extract_temporal_features.py
 ```
 
-3. Run the Streamlit demo:
+This reads `dataset/PainModel_EventCycle_AllSubjects_1 (1).csv` and creates `dataset/temporal_features.csv` with 23 engineered features per trial.
+
+### 3. Train Model
+
+Train logistic regression model with group-aware split (by Subject):
+
+```bash
+python train_temporal_model.py --model logistic --test-size 0.25 --random-state 42
+```
+
+Or compare multiple simple algorithms:
+
+```bash
+python compare_simple_models.py
+```
+
+### 4. Run Streamlit Demo
 
 ```bash
 streamlit run app.py
 ```
 
-Notes
-- Now each row is treated as one independent observation. The training script uses a stratified random train/test split (rows are split, not subjects), and preprocessing (scaler) is fit on the training rows only.
-- If your CSV contains multiple measurements per person and you intend to predict per-person status, you should aggregate rows to a person-level label before training.
+## Features
 
-Next steps
-- Add SHAP explanation panel in the app.
-- Improve feature engineering and nested cross-validation.
-- Add model calibration and exportable PDF reports.
+- **Temporal Feature Extraction**: 23 features including peak pain, pain slope, curvature, early/mid/late pain, statistical moments
+- **Group-Aware Splitting**: Train/test split by Subject to prevent data leakage
+- **Multiple Algorithms**: KNN, Decision Tree, Naive Bayes, LDA, Logistic Regression
+- **Cross-Validation**: Leave-One-Group-Out CV for robust evaluation
+- **Organized Outputs**: Results and images saved to dedicated folders
+
+## Models Trained
+
+- **Logistic Regression** (L2 regularization, C=1.0)
+- **KNN** (k=3, distance-weighted)
+- **Decision Tree** (max_depth=5, class_weight='balanced')
+- **Naive Bayes** (Gaussian)
+- **LDA** (with shrinkage)

@@ -201,23 +201,28 @@ def train_temporal_model(model_type='logistic', test_size=0.25, random_state=42)
     joblib.dump({'model': model, 'scaler': scaler, 'features': FEATURES}, 'model_temporal.joblib')
     joblib.dump(scaler, 'scaler_temporal.joblib')  # Also save separately for backward compatibility
     
+    # Create results directory if needed
+    from pathlib import Path
+    results_dir = Path('results')
+    results_dir.mkdir(exist_ok=True)
+    
     # Save test results
     test_df = features_df.iloc[test_idx].copy()
     test_df['pred'] = y_pred
     test_df['prob'] = y_pred_proba
-    test_df.to_csv('test_results_temporal.csv', index=False)
+    test_df.to_csv(results_dir / 'test_results_temporal.csv', index=False)
     
     # Save clean test set (for external validation)
     test_clean = test_df[['Subject', 'Condition', 'Task', 'Speed'] + FEATURES + ['true_label']]
-    test_clean.to_csv('test_set_temporal.csv', index=False)
+    test_clean.to_csv(results_dir / 'test_set_temporal.csv', index=False)
     
     print(f"\n{'='*60}")
     print("ARTIFACTS SAVED")
     print(f"{'='*60}")
     print(f"✓ Model + features: model_temporal.joblib")
     print(f"✓ Scaler:           scaler_temporal.joblib")
-    print(f"✓ Test predictions: test_results_temporal.csv")
-    print(f"✓ Test set (clean): test_set_temporal.csv")
+    print(f"✓ Test predictions: results/test_results_temporal.csv")
+    print(f"✓ Test set (clean): results/test_set_temporal.csv")
     
     # Final warning
     print(f"\n{'⚠'*30}")
