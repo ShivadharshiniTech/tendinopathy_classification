@@ -95,7 +95,6 @@ For **labeled** data (with condition column) - test model performance:
 2. See predictions with key features
 3. View performance metrics (accuracy, precision, recall, F1, AUC)
 4. Interactive confusion matrix and ROC/PR curves
-5. Live prediction simulator
 
 **Supported file formats:** CSV (.csv), Excel (.xlsx, .xls)
 

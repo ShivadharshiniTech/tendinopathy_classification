@@ -872,58 +872,7 @@ def model_evaluation_mode(model_obj, scaler_obj):
                 except Exception:
                     pass
 
-    st.header('3) Live Replay Simulator')
-    st.caption('Upload temporal features file to replay predictions row-by-row.')
-    sim_file = st.file_uploader('Upload temporal features file (CSV or Excel)', type=['csv', 'xlsx', 'xls'], key='sim')
-    if sim_file is not None:
-        try:
-            sim_df = read_uploaded_file(sim_file)
-        except Exception as e:
-            st.error(f'Failed to read file: {e}')
-            return
-        start = st.button('Start simulation')
-        if start:
-            placeholder = st.empty()
-            for _, row in sim_df.iterrows():
-                text = ''
-                if 'Subject' in row:
-                    text += f'Subject {row.Subject} '
-                if 'Condition' in row:
-                    text += f'— {row.Condition} '
-                
-                # Check for true label
-                true_label = None
-                if 'true_label' in row:
-                    true_label = int(row.true_label)
-                elif 'target' in row:
-                    true_label = int(row.target)
-                elif 'label' in row:
-                    true_label = int(row.label)
-                
-                if true_label is not None:
-                    text += f'— True: {true_label} '
-                
-                # ensure features
-                r = row.to_frame().T
-                for f in (model_obj['features'] if model_obj is not None else []):
-                    if f not in r.columns:
-                        r[f] = 0
-                if model_obj is not None:
-                    p = predict_df(model_obj, scaler_obj, r)[['prob_tendinopathy', 'pred_tendinopathy']].iloc[0]
-                    pred_class = int(p.pred_tendinopathy)
-                    text += f'— Pred: {pred_class} (prob={p.prob_tendinopathy:.3f})'
-                    
-                    # Add checkmark or X if we have true label
-                    if true_label is not None:
-                        if pred_class == true_label:
-                            text += ' ✓'
-                        else:
-                            text += ' ✗'
-                
-                placeholder.write(text)
-                time.sleep(0.6)
-
-    st.header('4) Model Evaluation (Interactive)')
+    st.header('3) Model Evaluation (Interactive)')
     st.write('Load the `test_results_temporal.csv` from training, or upload your own test file with `true_label` and `prob`/`pred` columns.')
 
     # Option to load bundled test_results_temporal.csv or upload
