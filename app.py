@@ -304,20 +304,37 @@ def plot_shap_explanation(model_obj, scaler_obj, features_df, idx=0):
     # Prepare data
     X = features_df[feature_names].iloc[[idx]]
     X_scaled = scaler.transform(X) if scaler is not None else X.values
+    X_scaled_flat = X_scaled[0]  # Get 1D array
     
-    # Create SHAP explainer (use model directly for LogisticRegression)
-    explainer = shap.Explainer(model, X_scaled)
-    shap_values = explainer(X_scaled)
+    # For LogisticRegression, compute SHAP values from coefficients
+    # SHAP value = coefficient * feature_value (for scaled features with mean=0)
+    coefficients = model.coef_[0]
+    intercept = model.intercept_[0]
+    shap_vals = coefficients * X_scaled_flat
     
-    # Plot waterfall
+    # Plot horizontal bar chart of SHAP values
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(10, 6))
-    shap.plots.waterfall(shap_values[0], show=False)
+    
+    # Sort by absolute SHAP value
+    sorted_idx = np.argsort(np.abs(shap_vals))[::-1][:10]
+    top_shap = shap_vals[sorted_idx]
+    top_names = [feature_names[i] for i in sorted_idx]
+    
+    colors = ['#FF6B6B' if val > 0 else '#4ECDC4' for val in top_shap]
+    ax.barh(range(len(top_shap)), top_shap, color=colors)
+    ax.set_yticks(range(len(top_shap)))
+    ax.set_yticklabels(top_names)
+    ax.set_xlabel('SHAP Value (Impact on Prediction)')
+    ax.set_title('Top 10 Feature Importance')
+    ax.axvline(x=0, color='k', linestyle='--', linewidth=0.8)
+    ax.invert_yaxis()
+    plt.tight_layout()
+    
     st.pyplot(fig, clear_figure=True)
     plt.close()
     
     # Return top features
-    shap_vals = shap_values.values[0]
     top_features = pd.DataFrame({
         'feature': feature_names,
         'shap_value': shap_vals,
