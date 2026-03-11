@@ -37,6 +37,7 @@ Thumbs.db
 dataset/
 data/
 test data/
+c3d inputs/
 
 # Output folders (generated results and images)
 results/

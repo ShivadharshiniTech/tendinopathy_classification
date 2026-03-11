@@ -1,4 +1,5 @@
 pandas
+numpy
 scikit-learn
 joblib
 streamlit
@@ -10,3 +11,5 @@ openpyxl
 google-genai
 python-dotenv
 openai
+ezc3d
+scipy

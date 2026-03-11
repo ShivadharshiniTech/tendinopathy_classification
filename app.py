@@ -511,7 +511,6 @@ Keep each section clear, actionable, and evidence-based."""
 def realtime_prediction_mode(model_obj, scaler_obj):
     """Real-time prediction mode for unlabeled data"""
     st.header('🔬 Real-time Tendinopathy Prediction')
-    st.caption('Upload patient EventCycle data to get instant prediction with explainable AI')
     
     # Groq API key: try .env first, then sidebar input (PRIMARY)
     st.sidebar.subheader('🤖 AI Configuration')
@@ -530,96 +529,100 @@ def realtime_prediction_mode(model_obj, scaler_obj):
     else:
         gemini_key = st.sidebar.text_input('Gemini API Key (Fallback)', type='password', help='Get your key at https://makersuite.google.com/app/apikey')
     
-    uploaded = st.file_uploader('Upload EventCycle file (CSV or Excel)', type=['csv', 'xlsx', 'xls'], key='realtime')
+    # Create tabs for different input methods
+    tab1, tab2 = st.tabs(["📁 C3D File (Full Automation)", "📊 EventCycle Data (Processed)"])
     
-    if uploaded is not None:
-        try:
-            raw_df = read_uploaded_file(uploaded)
-        except Exception as e:
-            st.error(f'Failed to read file: {e}')
-            return
+    with tab1:
+        st.caption('🚀 Upload C3D motion capture file for complete automated analysis')
+        st.info('**New!** Upload raw C3D files directly - no OpenSim or MATLAB needed')
         
-        st.write(f'**Loaded:** {len(raw_df)} event cycles')
+        # C3D file upload
+        c3d_uploaded = st.file_uploader('Upload C3D file from motion capture', 
+                                        type=['c3d'], key='c3d_upload')
         
-        # Validate required columns
-        required_cols = ['Subject', 'Task', 'Speed', 'Pain_pred']
-        missing = [c for c in required_cols if c not in raw_df.columns]
-        
-        if missing:
-            st.error(f'Missing required columns: {missing}')
-            st.info('Required: Subject, Task, Speed, EventCycle, Pain_pred')
-            return
-        
-        # Extract temporal features
-        with st.spinner('🔄 Extracting temporal features from event cycles...'):
-            # Add dummy Condition for extraction function
-            if 'Condition' not in raw_df.columns:
-                raw_df['Condition'] = 'unknown'
-            features_df = extract_temporal_features_from_eventcycle(raw_df)
-        
-        if len(features_df) == 0:
-            st.error('No trials extracted. Check your data format.')
-            return
-        
-        # Predict
-        if model_obj is not None:
-            for f in model_obj['features']:
-                if f not in features_df.columns:
-                    features_df[f] = 0
+        if c3d_uploaded is not None:
+            # Save uploaded file temporarily
+            import tempfile
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.c3d') as tmp_file:
+                tmp_file.write(c3d_uploaded.read())
+                tmp_path = tmp_file.name
             
-            preds = predict_df(model_obj, scaler_obj, features_df)
-            
-            # Display each trial
-            for idx, row in preds.iterrows():
-                with st.container():
+            try:
+                # Import automation pipeline
+                from automation_pipeline import c3d_to_prediction_pipeline
+                
+                st.write('Processing C3D file...')
+                
+                # Optional metadata inputs
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    subject_id = st.number_input('Subject ID', min_value=1, value=1)
+                with col2:
+                    task = st.selectbox('Task', ['WithTask', 'Rest'])
+                with col3:
+                    speed = st.selectbox('Speed', ['Fast', 'Medium', 'Slow'])
+                
+                if st.button('🚀 Run Automated Analysis', type='primary'):
+                    with st.spinner('Running complete pipeline: C3D → Kinematics → Forces → Pain Model → ML Prediction...'):
+                        result = c3d_to_prediction_pipeline(
+                            tmp_path,
+                            model_obj,
+                            scaler_obj,
+                            condition='unknown',
+                            subject_id=subject_id,
+                            task=task,
+                            speed=speed
+                        )
+                    
+                    # Display prediction
+                    pred_class = result['prediction']
+                    prob = result['probability']
+                    
                     st.markdown('---')
-                    
-                    # Trial info
-                    subj = row.get('Subject', 'Unknown')
-                    task = row.get('Task', 'Unknown')
-                    speed = row.get('Speed', 'Unknown')
-                    trial_info = f"Subject {subj}, Task: {task}, Speed: {speed}"
-                    
-                    st.subheader(f"Trial: {trial_info}")
-                    
-                    # 1️⃣ Prediction
-                    prob = row['prob_tendinopathy']
-                    pred_class = int(row['pred_tendinopathy'])
-                    condition = "🔴 **Tendinopathy**" if pred_class == 1 else "🟢 **Normal**"
-                    confidence = prob if pred_class == 1 else (1 - prob)
+                    st.subheader('🎯 Prediction Results')
                     
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.metric('Prediction', condition)
+                        if pred_class == 1:
+                            st.error(f'**Prediction:** TENDINOPATHY')
+                        else:
+                            st.success(f'**Prediction:** NORMAL')
+                    
                     with col2:
-                        st.metric('Confidence', f'{confidence*100:.1f}%')
+                        confidence = result['confidence']
+                        st.metric('Confidence', f'{confidence:.1%}')
                     
-                    # 2️⃣ SHAP Feature Importance
-                    st.subheader('2️⃣ Feature Importance (SHAP)')
-                    try:
-                        with st.spinner('📊 Calculating feature importance...'):
-                            top_features = plot_shap_explanation(model_obj, scaler_obj, features_df, idx)
-                    except Exception as e:
-                        st.error(f'SHAP explanation failed: {e}')
-                        top_features = None
+                    # Show pain curve
+                    st.subheader('🔁 Pain Over Movement Cycle')
+                    pain_df = result['pain_cycle_df']
+                    import plotly.graph_objects as go
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=pain_df['EventCycle'],
+                        y=pain_df['Pain_pred'],
+                        mode='lines',
+                        line=dict(color='red' if pred_class == 1 else 'green', width=3),
+                        name='Pain'
+                    ))
+                    fig.update_layout(
+                        title='Predicted Pain Over Event Cycle',
+                        xaxis_title='Event Cycle (%)',
+                        yaxis_title='Pain (0-10)',
+                        yaxis_range=[0, 10],
+                        height=400
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
                     
-                    # 3️⃣ Pain Curve
-                    st.subheader('3️⃣ Pain Progression')
-                    try:
-                        # Get raw event data for this trial
-                        trial_raw = raw_df[
-                            (raw_df['Subject'] == subj) & 
-                            (raw_df['Task'] == task) & 
-                            (raw_df['Speed'] == speed)
-                        ].sort_values('EventCycle')
-                        plot_pain_curve(trial_raw, trial_info)
-                    except Exception as e:
-                        st.error(f'Pain curve visualization failed: {e}')
+                    # SHAP explanation
+                    st.subheader('📊 Feature Importance (SHAP)')
+                    features_df = result['temporal_features']
+                    with st.spinner('📊 Calculating SHAP values...'):
+                        top_features = plot_shap_explanation(model_obj, scaler_obj, features_df, idx=0)
                     
-                    # 4️⃣ LLM Clinical Explanation
-                    st.subheader('4️⃣ Comprehensive Clinical Report (AI-Generated)')
-                    explanation = None
-                    api_used = None
+                    # LLM Explanation
+                    st.subheader('🤖 AI Clinical Report')
+                    trial_info = f"Subject {subject_id}, Task: {task}, Speed: {speed}"
+                    
                     if top_features is not None:
                         with st.spinner('🤖 Generating comprehensive clinical report with AI... This may take 10-20 seconds.'):
                             explanation, api_used = generate_llm_explanation(pred_class, prob, top_features, trial_info, groq_key, gemini_key)
@@ -628,14 +631,135 @@ def realtime_prediction_mode(model_obj, scaler_obj):
                             st.markdown(explanation)
                         else:
                             st.error('Failed to generate report. Please check your API keys and try again.')
-                    else:
-                        st.warning('Cannot generate explanation without SHAP features')
                     
-                    # 5️⃣ Download Report
-                    st.subheader('5️⃣ Download Report')
-                    if top_features is not None:
-                        # Build comprehensive report
-                        report_text = f"""TENDINOPATHY CLASSIFICATION REPORT
+                    # Summary metrics
+                    st.subheader('📈 Summary Metrics')
+                    metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
+                    with metrics_col1:
+                        st.metric('Peak Pain', f"{result['metadata']['peak_pain']:.2f}/10")
+                    with metrics_col2:
+                        st.metric('Mean Pain', f"{result['metadata']['mean_pain']:.2f}/10")
+                    with metrics_col3:
+                        st.metric('Duration', f"{result['metadata']['duration_s']:.1f}s")
+                
+            except Exception as e:
+                st.error(f'Error processing C3D file: {e}')
+                st.info('Make sure ezc3d is installed: pip install ezc3d')
+                import traceback
+                st.code(traceback.format_exc())
+            finally:
+                # Clean up temp file
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+    
+    with tab2:
+        st.caption('Upload pre-processed EventCycle data (CSV or Excel) for quick prediction')
+        uploaded = st.file_uploader('Upload EventCycle file (CSV or Excel)', type=['csv', 'xlsx', 'xls'], key='realtime')
+        
+        if uploaded is not None:
+            try:
+                raw_df = read_uploaded_file(uploaded)
+            except Exception as e:
+                st.error(f'Failed to read file: {e}')
+                return
+            
+            st.write(f'**Loaded:** {len(raw_df)} event cycles')
+            
+            # Validate required columns
+            required_cols = ['Subject', 'Task', 'Speed', 'Pain_pred']
+            missing = [c for c in required_cols if c not in raw_df.columns]
+            
+            if missing:
+                st.error(f'Missing required columns: {missing}')
+                st.info('Required: Subject, Task, Speed, EventCycle, Pain_pred')
+                return
+            
+            # Extract temporal features
+            with st.spinner('🔄 Extracting temporal features from event cycles...'):
+                # Add dummy Condition for extraction function
+                if 'Condition' not in raw_df.columns:
+                    raw_df['Condition'] = 'unknown'
+                features_df = extract_temporal_features_from_eventcycle(raw_df)
+            
+            if len(features_df) == 0:
+                st.error('No trials extracted. Check your data format.')
+                return
+            
+            # Predict
+            # Predict
+            if model_obj is not None:
+                for f in model_obj['features']:
+                    if f not in features_df.columns:
+                        features_df[f] = 0
+                
+                preds = predict_df(model_obj, scaler_obj, features_df)
+                
+                # Display each trial
+                for idx, row in preds.iterrows():
+                    with st.container():
+                        st.markdown('---')
+                        
+                        # Trial info
+                        subj = row.get('Subject', 'Unknown')
+                        task = row.get('Task', 'Unknown')
+                        speed = row.get('Speed', 'Unknown')
+                        trial_info = f"Subject {subj}, Task: {task}, Speed: {speed}"
+                        
+                        st.subheader(f"Trial: {trial_info}")
+                        
+                        # 1️⃣ Prediction
+                        prob = row['prob_tendinopathy']
+                        pred_class = int(row['pred_tendinopathy'])
+                        condition = "🔴 **Tendinopathy**" if pred_class == 1 else "🟢 **Normal**"
+                        confidence = prob if pred_class == 1 else (1 - prob)
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.metric('Prediction', condition)
+                        with col2:
+                            st.metric('Confidence', f'{confidence*100:.1f}%')
+                        
+                        # 2️⃣ SHAP Feature Importance
+                        st.subheader('2️⃣ Feature Importance (SHAP)')
+                        try:
+                            with st.spinner('📊 Calculating feature importance...'):
+                                top_features = plot_shap_explanation(model_obj, scaler_obj, features_df, idx)
+                        except Exception as e:
+                            st.error(f'SHAP explanation failed: {e}')
+                            top_features = None
+                        
+                        # 3️⃣ Pain Curve
+                        st.subheader('3️⃣ Pain Progression')
+                        try:
+                            # Get raw event data for this trial
+                            trial_raw = raw_df[
+                                (raw_df['Subject'] == subj) & 
+                                (raw_df['Task'] == task) & 
+                                (raw_df['Speed'] == speed)
+                            ].sort_values('EventCycle')
+                            plot_pain_curve(trial_raw, trial_info)
+                        except Exception as e:
+                            st.error(f'Pain curve visualization failed: {e}')
+                        
+                        # 4️⃣ LLM Clinical Explanation
+                        st.subheader('4️⃣ Comprehensive Clinical Report (AI-Generated)')
+                        explanation = None
+                        api_used = None
+                        if top_features is not None:
+                            with st.spinner('🤖 Generating comprehensive clinical report with AI... This may take 10-20 seconds.'):
+                                explanation, api_used = generate_llm_explanation(pred_class, prob, top_features, trial_info, groq_key, gemini_key)
+                        if explanation:
+                            st.success(f'✅ Report generated successfully using {api_used}!')
+                            st.markdown(explanation)
+                        else:
+                            st.error('Failed to generate report. Please check your API keys and try again.')
+
+                        
+                        # 5️⃣ Download Report
+                        st.subheader('5️⃣ Download Report')
+                        if top_features is not None:
+                            # Build comprehensive report
+                            report_text = f"""TENDINOPATHY CLASSIFICATION REPORT
 {'='*60}
 
 Trial Information:
@@ -648,49 +772,49 @@ Prediction Results:
 
 Top 10 Contributing Features (SHAP Analysis):
 """
-                        for i, feat_row in top_features.iterrows():
-                            report_text += f"  {feat_row['feature']:25s} | SHAP: {feat_row['shap_value']:+.4f} | Importance: {feat_row['abs_shap']:.4f}\n"
-                        
-                        if explanation:
-                            report_text += f"\n\nCOMPREHENSIVE CLINICAL ANALYSIS:\n{'='*60}\n"
-                            if api_used:
-                                report_text += f"(Generated using: {api_used})\n\n"
-                            report_text += f"{explanation}\n"
-                        
-                        report_text += f"\n\n{'='*60}\nReport Generated: {pd.Timestamp.now()}\n"
-                        
-                        # Download button
-                        st.download_button(
-                            label='📥 Download Complete Report (TXT)',
-                            data=report_text,
-                            file_name=f'tendinopathy_report_{subj}_{task}_{speed}.txt',
-                            mime='text/plain',
-                            key=f'download_txt_{idx}'
-                        )
-                        
-                        # Also create CSV version with key data
-                        csv_data = pd.DataFrame([{
-                            'Subject': subj,
-                            'Task': task,
-                            'Speed': speed,
-                            'Prediction': condition.replace('🔴 **', '').replace('🟢 **', '').replace('**', ''),
-                            'Confidence': f'{confidence*100:.1f}%',
-                            'Prob_Tendinopathy': prob,
-                            'Top_Feature_1': top_features.iloc[0]['feature'] if len(top_features) > 0 else '',
-                            'Top_Feature_1_SHAP': top_features.iloc[0]['shap_value'] if len(top_features) > 0 else 0,
-                            'Top_Feature_2': top_features.iloc[1]['feature'] if len(top_features) > 1 else '',
-                            'Top_Feature_2_SHAP': top_features.iloc[1]['shap_value'] if len(top_features) > 1 else 0,
-                            'Top_Feature_3': top_features.iloc[2]['feature'] if len(top_features) > 2 else '',
-                            'Top_Feature_3_SHAP': top_features.iloc[2]['shap_value'] if len(top_features) > 2 else 0,
-                        }])
-                        
-                        st.download_button(
-                            label='📥 Download Key Metrics (CSV)',
-                            data=csv_data.to_csv(index=False),
-                            file_name=f'tendinopathy_metrics_{subj}_{task}_{speed}.csv',
-                            mime='text/csv',
-                            key=f'download_csv_{idx}'
-                        )
+                            for i, feat_row in top_features.iterrows():
+                                report_text += f"  {feat_row['feature']:25s} | SHAP: {feat_row['shap_value']:+.4f} | Importance: {feat_row['abs_shap']:.4f}\n"
+                            
+                            if explanation:
+                                report_text += f"\n\nCOMPREHENSIVE CLINICAL ANALYSIS:\n{'='*60}\n"
+                                if api_used:
+                                    report_text += f"(Generated using: {api_used})\n\n"
+                                report_text += f"{explanation}\n"
+                            
+                            report_text += f"\n\n{'='*60}\nReport Generated: {pd.Timestamp.now()}\n"
+                            
+                            # Download button
+                            st.download_button(
+                                label='📥 Download Complete Report (TXT)',
+                                data=report_text,
+                                file_name=f'tendinopathy_report_{subj}_{task}_{speed}.txt',
+                                mime='text/plain',
+                                key=f'download_txt_{idx}'
+                            )
+                            
+                            # Also create CSV version with key data
+                            csv_data = pd.DataFrame([{
+                                'Subject': subj,
+                                'Task': task,
+                                'Speed': speed,
+                                'Prediction': condition.replace('🔴 **', '').replace('🟢 **', '').replace('**', ''),
+                                'Confidence': f'{confidence*100:.1f}%',
+                                'Prob_Tendinopathy': prob,
+                                'Top_Feature_1': top_features.iloc[0]['feature'] if len(top_features) > 0 else '',
+                                'Top_Feature_1_SHAP': top_features.iloc[0]['shap_value'] if len(top_features) > 0 else 0,
+                                'Top_Feature_2': top_features.iloc[1]['feature'] if len(top_features) > 1 else '',
+                                'Top_Feature_2_SHAP': top_features.iloc[1]['shap_value'] if len(top_features) > 1 else 0,
+                                'Top_Feature_3': top_features.iloc[2]['feature'] if len(top_features) > 2 else '',
+                                'Top_Feature_3_SHAP': top_features.iloc[2]['shap_value'] if len(top_features) > 2 else 0,
+                            }])
+                            
+                            st.download_button(
+                                label='📥 Download Key Metrics (CSV)',
+                                data=csv_data.to_csv(index=False),
+                                file_name=f'tendinopathy_metrics_{subj}_{task}_{speed}.csv',
+                                mime='text/csv',
+                                key=f'download_csv_{idx}'
+                            )
 
 
 def model_evaluation_mode(model_obj, scaler_obj):

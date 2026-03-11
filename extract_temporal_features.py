@@ -85,6 +85,81 @@ def load_and_extract_features():
     
     return features_df
 
+
+def extract_temporal_features_from_event_cycle(event_df):
+    """
+    Extract temporal features from raw event-cycle data
+    (Used by automation pipeline and real-time predictions)
+    
+    Args:
+        event_df: DataFrame with columns: Subject, Condition, Task, Speed, EventCycle, Pain_pred
+        
+    Returns:
+        DataFrame with extracted temporal features for each trial
+    """
+    trials = []
+    
+    for (subj, cond, task, speed), group in event_df.groupby(
+        ['Subject', 'Condition', 'Task', 'Speed']
+    ):
+        pain = group['Pain_pred'].values
+        
+        # Basic statistics
+        features = {
+            'Subject': subj,
+            'Condition': cond,
+            'Task': task,
+            'Speed': speed,
+            
+            # Central tendency
+            'peak_pain': np.max(pain),
+            'mean_pain': np.mean(pain),
+            'median_pain': np.median(pain),
+            'min_pain': np.min(pain),
+            
+            # Dispersion
+            'std_pain': np.std(pain),
+            'pain_range': np.max(pain) - np.min(pain),
+            'pain_cv': np.std(pain) / np.mean(pain) if np.mean(pain) > 0 else 0,
+            'iqr_pain': np.percentile(pain, 75) - np.percentile(pain, 25),
+            
+            # Percentiles
+            'percentile_95': np.percentile(pain, 95),
+            'percentile_75': np.percentile(pain, 75),
+            'percentile_25': np.percentile(pain, 25),
+            'percentile_5': np.percentile(pain, 5),
+            
+            # Temporal dynamics
+            'time_to_peak': np.argmax(pain) / len(pain) if len(pain) > 0 else 0,
+            'pain_slope': np.polyfit(range(len(pain)), pain, 1)[0] if len(pain) > 1 else 0,
+            'pain_curvature': np.polyfit(range(len(pain)), pain, 2)[0] if len(pain) > 2 else 0,
+            
+            # Phase-based
+            'early_pain': np.mean(pain[:len(pain)//3]) if len(pain) >= 3 else np.mean(pain),
+            'mid_pain': np.mean(pain[len(pain)//3:2*len(pain)//3]) if len(pain) >= 3 else np.mean(pain),
+            'late_pain': np.mean(pain[2*len(pain)//3:]) if len(pain) >= 3 else np.mean(pain),
+            
+            # Derived metrics
+            'pain_acceleration': np.mean(np.diff(np.diff(pain))) if len(pain) > 2 else 0,
+            'pain_skewness': pd.Series(pain).skew(),
+            'pain_kurtosis': pd.Series(pain).kurtosis(),
+            
+            # Onset/offset
+            'onset_rate': (pain[10] - pain[0]) / 10 if len(pain) > 10 else 0,
+            'offset_rate': (pain[-1] - pain[-10]) / 10 if len(pain) > 10 else 0,
+        }
+        
+        trials.append(features)
+    
+    features_df = pd.DataFrame(trials)
+    
+    # Add target label if Condition is present
+    if 'Condition' in features_df.columns:
+        features_df['true_label'] = (features_df['Condition'].str.lower().str.contains('tend')).astype(int)
+    
+    return features_df
+
+
 def save_features(features_df, filename='dataset/temporal_features.csv'):
     """Save extracted features"""
     features_df.to_csv(filename, index=False)
