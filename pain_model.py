@@ -4,6 +4,7 @@ Converts muscle force time series to pain predictions over event cycle
 """
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from scipy.signal import medfilt
 from scipy.interpolate import interp1d
 
@@ -144,7 +145,7 @@ class PainModel:
         return result_df
     
     def process_muscle_forces(self, forces_df, condition='normal', subject_id=1, 
-                              task='WithTask', speed='Medium'):
+                              task='WithTask', speed='Medium', intermediate_dir=None):
         """
         Complete pipeline: muscle forces → pain prediction
         
@@ -158,25 +159,80 @@ class PainModel:
         Returns:
             DataFrame with Subject, Condition, Task, Speed, EventCycle, Pain_pred
         """
+        print(f"[DEBUG] process_muscle_forces called with intermediate_dir={intermediate_dir}")
         # Compute combined force
         F_combined = self.compute_combined_force(
             forces_df['ECU_N'].values,
             forces_df['ECRL_N'].values,
             forces_df['ECRB_N'].values
         )
-        
-        # Normalize to event cycle
-        Fe_cycle = self.normalize_to_event_cycle(F_combined)
-        
+
+        # Ensure intermediate_dir exists if requested
+        if intermediate_dir is not None:
+            Path(intermediate_dir).mkdir(parents=True, exist_ok=True)
+            print(f"[DEBUG] Saving intermediates to: {intermediate_dir}")
+
+        # Save F_combined if requested
+        if intermediate_dir is not None:
+            pd.DataFrame({'F_combined': F_combined}).to_csv(
+                Path(intermediate_dir) / 'F_combined.csv', index=False)
+            print(f"[DEBUG] Saved F_combined.csv ({len(F_combined)} values)")
+
+        # --- Normalize to event cycle (save all intermediates) ---
+        # Normalize force to [0, 1]
+        F_norm = F_combined / (np.max(F_combined) + 1e-10)
+        if intermediate_dir is not None:
+            pd.DataFrame({'F_norm': F_norm}).to_csv(
+                Path(intermediate_dir) / 'F_norm.csv', index=False)
+            print(f"[DEBUG] Saved F_norm.csv ({len(F_norm)} values)")
+
+        # Find event boundaries (where force > threshold)
+        idx = np.where(F_norm > self.thresh_frac)[0]
+        if intermediate_dir is not None:
+            pd.DataFrame({'idx': idx}).to_csv(
+                Path(intermediate_dir) / 'event_indices.csv', index=False)
+            print(f"[DEBUG] Saved event_indices.csv ({len(idx)} values)")
+
+        if len(idx) == 0:
+            Fe = np.zeros(self.n_cycle_pts)
+        else:
+            Fe = F_norm[idx[0]:idx[-1]+1]
+        if intermediate_dir is not None:
+            pd.DataFrame({'Fe': Fe}).to_csv(
+                Path(intermediate_dir) / 'Fe.csv', index=False)
+            print(f"[DEBUG] Saved Fe.csv ({len(Fe)} values)")
+
+        # Interpolate to 101 points (0-100%)
+        if len(Fe) < 2:
+            Fe_cycle = np.zeros(self.n_cycle_pts)
+        else:
+            original_cycle = np.linspace(0, 100, len(Fe))
+            target_cycle = np.linspace(0, 100, self.n_cycle_pts)
+            from scipy.interpolate import interp1d
+            interp_func = interp1d(original_cycle, Fe, kind='linear', 
+                                   bounds_error=False, fill_value='extrapolate')
+            Fe_cycle = interp_func(target_cycle)
+            Fe_cycle = np.maximum(Fe_cycle, 0)
+            from scipy.signal import medfilt
+            Fe_cycle = medfilt(Fe_cycle, kernel_size=5)
+        if intermediate_dir is not None:
+            pd.DataFrame({'Fe_cycle': Fe_cycle}).to_csv(
+                Path(intermediate_dir) / 'Fe_cycle.csv', index=False)
+            print(f"[DEBUG] Saved Fe_cycle.csv ({len(Fe_cycle)} values)")
+
         # Compute pain
         pain_df = self.compute_pain(Fe_cycle, condition=condition, subject_id=subject_id)
-        
+        if intermediate_dir is not None:
+            pd.DataFrame({'Pain': pain_df['Pain_pred'].values}).to_csv(
+                Path(intermediate_dir) / 'Pain.csv', index=False)
+            print(f"[DEBUG] Saved Pain.csv ({len(pain_df['Pain_pred'].values)} values)")
+
         # Add metadata
         pain_df.insert(0, 'Subject', subject_id)
         pain_df.insert(1, 'Condition', condition)
         pain_df.insert(2, 'Task', task)
         pain_df.insert(3, 'Speed', speed)
-        
+
         return pain_df
     
     def reset_damage_memory(self):

@@ -564,6 +564,11 @@ def realtime_prediction_mode(model_obj, scaler_obj):
                 
                 if st.button('🚀 Run Automated Analysis', type='primary'):
                     with st.spinner('Running complete pipeline: C3D → Kinematics → Forces → Pain Model → ML Prediction...'):
+                        # Set intermediate_dir to intermediate/<uploaded_file_name_without_ext>
+                        from pathlib import Path
+                        upload_base = Path(c3d_uploaded.name).stem
+                        intermediate_dir = os.path.join('intermediate', upload_base)
+                        os.makedirs(intermediate_dir, exist_ok=True)
                         result = c3d_to_prediction_pipeline(
                             tmp_path,
                             model_obj,
@@ -571,7 +576,9 @@ def realtime_prediction_mode(model_obj, scaler_obj):
                             condition='unknown',
                             subject_id=subject_id,
                             task=task,
-                            speed=speed
+                            speed=speed,
+                            # Pass intermediate_dir for debug saving
+                            intermediate_dir=intermediate_dir
                         )
                     
                     # Display prediction
