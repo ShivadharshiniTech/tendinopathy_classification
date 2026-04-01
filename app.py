@@ -28,13 +28,14 @@ except Exception:
     _HAS_GEMINI = False
 
 
-STATIC_OPTIMIZATION_MAX_DURATION_SECONDS = 0.2
+SMOKE_TEST_MAX_DURATION_SECONDS = 0.2
 
 
 def run_static_optimization(
     trial_name: str,
     ik_path: str,
     output_dir: str,
+    max_duration_seconds: float | None = None,
     log_callback=None,
 ) -> list[str]:
     """Run OpenSim Static Optimization for one IK result and return .sto outputs."""
@@ -129,13 +130,14 @@ def run_static_optimization(
         log_callback(f"Tuned model copy created: {tuned_model_path}")
 
     start_time, end_time = get_mot_time_range(ik_path)
-    capped_end_time = min(end_time, start_time + STATIC_OPTIMIZATION_MAX_DURATION_SECONDS)
-    if capped_end_time < end_time and log_callback is not None:
-        log_callback(
-            f"Smoke test mode: limiting Static Optimization to {STATIC_OPTIMIZATION_MAX_DURATION_SECONDS:.3f} s "
-            f"from {start_time:.3f} to {capped_end_time:.3f}."
-        )
-    end_time = capped_end_time
+    if max_duration_seconds is not None:
+        capped_end_time = min(end_time, start_time + max_duration_seconds)
+        if capped_end_time < end_time and log_callback is not None:
+            log_callback(
+                f"Smoke test mode: limiting Static Optimization to {max_duration_seconds:.3f} s "
+                f"from {start_time:.3f} to {capped_end_time:.3f}."
+            )
+        end_time = capped_end_time
 
     with open(template_path, "r", encoding="utf-8") as f:
         xml_text = f.read()
@@ -410,8 +412,15 @@ def main() -> None:
         "The simplified direct method is removed. Only OpenSim + converted pain model path runs."
     )
     st.sidebar.subheader("AI Configuration (optional)")
+    run_mode = st.sidebar.selectbox(
+        "Static Optimization mode",
+        ["Smoke test (0.2 s)", "Full run"],
+        index=0,
+        help="Smoke test is faster and useful to confirm the flow. Full run uses the entire IK duration.",
+    )
     groq_key = st.sidebar.text_input("Groq API Key", type="password")
     gemini_key = st.sidebar.text_input("Gemini API Key", type="password")
+    max_duration_seconds = None if run_mode == "Full run" else SMOKE_TEST_MAX_DURATION_SECONDS
     model_obj = load_model_bundle("model_temporal.joblib")
     if model_obj is None:
         st.error("`model_temporal.joblib` not found. Train/load model before running classification.")
@@ -461,7 +470,13 @@ def main() -> None:
             status.write(f"IK MOT generated: {ik_path}")
 
             status.write("Running Static Optimization...")
-            sto_paths = run_static_optimization(trial, ik_path, str(trial_dir), log_callback=status.write)
+            sto_paths = run_static_optimization(
+                trial,
+                ik_path,
+                str(trial_dir),
+                max_duration_seconds=max_duration_seconds,
+                log_callback=status.write,
+            )
             primary_sto = pick_primary_sto(sto_paths)
             status.write(f"Static Optimization completed: {primary_sto}")
 
