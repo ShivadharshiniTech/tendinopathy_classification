@@ -28,6 +28,9 @@ except Exception:
     _HAS_GEMINI = False
 
 
+STATIC_OPTIMIZATION_MAX_DURATION_SECONDS = 0.2
+
+
 def run_static_optimization(
     trial_name: str,
     ik_path: str,
@@ -126,6 +129,13 @@ def run_static_optimization(
         log_callback(f"Tuned model copy created: {tuned_model_path}")
 
     start_time, end_time = get_mot_time_range(ik_path)
+    capped_end_time = min(end_time, start_time + STATIC_OPTIMIZATION_MAX_DURATION_SECONDS)
+    if capped_end_time < end_time and log_callback is not None:
+        log_callback(
+            f"Smoke test mode: limiting Static Optimization to {STATIC_OPTIMIZATION_MAX_DURATION_SECONDS:.3f} s "
+            f"from {start_time:.3f} to {capped_end_time:.3f}."
+        )
+    end_time = capped_end_time
 
     with open(template_path, "r", encoding="utf-8") as f:
         xml_text = f.read()
