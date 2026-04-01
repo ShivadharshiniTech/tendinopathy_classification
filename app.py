@@ -1,1071 +1,510 @@
-import streamlit as st
-import joblib
-import time
-from pathlib import Path
-import pandas as pd
-import numpy as np
 import os
-from dotenv import load_dotenv
+import subprocess
+import tempfile
+import sys
+from pathlib import Path
 
-# Load environment variables from .env file
-load_dotenv()
+import joblib
+import numpy as np
+import streamlit as st
 
-try:
-    import plotly.express as px
-    import plotly.graph_objects as go
-    _HAS_PLOTLY = True
-except Exception:
-    px = None
-    go = None
-    _HAS_PLOTLY = False
-
-try:
-    import shap
-    _HAS_SHAP = True
-except Exception:
-    _HAS_SHAP = False
+from extract_temporal_features import extract_temporal_features_from_event_cycle
+from opensim_pain_pipeline import compute_event_cycle_from_sto
+from run_static_batch import TEMPLATE_IK_NAME, pick_template_for_trial
 
 try:
     from openai import OpenAI
+
     _HAS_OPENAI = True
 except Exception:
     _HAS_OPENAI = False
 
 try:
     from google import genai
+
     _HAS_GEMINI = True
 except Exception:
     _HAS_GEMINI = False
 
-from utils import load_temporal_features
-from sklearn.metrics import (
-    roc_auc_score,
-    accuracy_score,
-    confusion_matrix,
-    precision_score,
-    recall_score,
-    f1_score,
-    precision_recall_curve,
-    roc_curve,
-    brier_score_loss,
-)
 
+def run_static_optimization(trial_name: str, ik_path: str, output_dir: str) -> list[str]:
+    """Run OpenSim Static Optimization for one IK result and return .sto outputs."""
+    template_path = pick_template_for_trial(trial_name)
+    if not os.path.isfile(template_path):
+        raise FileNotFoundError(f"Template not found: {template_path}")
 
-def read_uploaded_file(uploaded_file):
-    """Read CSV or Excel file from uploaded file object"""
-    filename = uploaded_file.name.lower()
-    
-    if filename.endswith('.csv'):
-        return pd.read_csv(uploaded_file)
-    elif filename.endswith(('.xlsx', '.xls')):
-        return pd.read_excel(uploaded_file)
+    base_dir = Path(__file__).resolve().parent
+    abs_output_dir = Path(output_dir).resolve()
+    if "_nor_" in trial_name.lower():
+        model_path = base_dir / "osim models" / "Elbow_model_load.osim"
     else:
-        raise ValueError(f'Unsupported file format. Please upload CSV or Excel (.xlsx, .xls) files.')
+        model_path = base_dir / "osim models" / "Elbow_model.osim"
+
+    with open(template_path, "r", encoding="utf-8") as f:
+        xml_text = f.read()
+
+    xml_text = xml_text.replace("muscle_forces_result", abs_output_dir.as_posix())
+    xml_text = xml_text.replace("osim models/Elbow_model_load.osim", model_path.as_posix())
+    xml_text = xml_text.replace("osim models/Elbow_model.osim", model_path.as_posix())
+    xml_text = xml_text.replace(TEMPLATE_IK_NAME, os.path.basename(ik_path))
+
+    trial_xml_path = abs_output_dir / f"setup_static_{trial_name}.xml"
+    with open(trial_xml_path, "w", encoding="utf-8") as f:
+        f.write(xml_text)
+
+    result = subprocess.run(
+        ["opensim-cmd", "run-tool", str(trial_xml_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "OpenSim Static Optimization failed").strip())
+
+    sto_paths = []
+    for name in os.listdir(abs_output_dir):
+        if name.lower().endswith(".sto"):
+            sto_paths.append(str(abs_output_dir / name))
+    sto_paths.sort()
+    return sto_paths
 
 
-def extract_temporal_features_from_eventcycle(event_df):
-    """Extract temporal features from raw event-cycle data
-    
-    Args:
-        event_df: DataFrame with columns: Subject, Condition, Task, Speed, EventCycle, Pain_pred
-        
-    Returns:
-        DataFrame with extracted temporal features for each trial
-    """
-    trials = []
-    
-    for (subj, cond, task, speed), group in event_df.groupby(
-        ['Subject', 'Condition', 'Task', 'Speed']
-    ):
-        pain = group['Pain_pred'].values
-        
-        # Basic statistics
-        features = {
-            'Subject': subj,
-            'Condition': cond,
-            'Task': task,
-            'Speed': speed,
-            
-            # Central tendency
-            'peak_pain': np.max(pain),
-            'mean_pain': np.mean(pain),
-            'median_pain': np.median(pain),
-            'min_pain': np.min(pain),
-            
-            # Dispersion
-            'std_pain': np.std(pain),
-            'pain_range': np.max(pain) - np.min(pain),
-            'pain_cv': np.std(pain) / np.mean(pain) if np.mean(pain) > 0 else 0,
-            'iqr_pain': np.percentile(pain, 75) - np.percentile(pain, 25),
-            
-            # Percentiles
-            'percentile_95': np.percentile(pain, 95),
-            'percentile_75': np.percentile(pain, 75),
-            'percentile_25': np.percentile(pain, 25),
-            'percentile_5': np.percentile(pain, 5),
-            
-            # Temporal dynamics
-            'time_to_peak': np.argmax(pain) / len(pain) if len(pain) > 0 else 0,
-            'pain_slope': np.polyfit(range(len(pain)), pain, 1)[0] if len(pain) > 1 else 0,
-            'pain_curvature': np.polyfit(range(len(pain)), pain, 2)[0] if len(pain) > 2 else 0,
-            
-            # Phase-based
-            'early_pain': np.mean(pain[:len(pain)//3]) if len(pain) >= 3 else np.mean(pain),
-            'mid_pain': np.mean(pain[len(pain)//3:2*len(pain)//3]) if len(pain) >= 3 else np.mean(pain),
-            'late_pain': np.mean(pain[2*len(pain)//3:]) if len(pain) >= 3 else np.mean(pain),
-            
-            # Derived metrics
-            'pain_acceleration': np.mean(np.diff(np.diff(pain))) if len(pain) > 2 else 0,
-            'pain_skewness': pd.Series(pain).skew(),
-            'pain_kurtosis': pd.Series(pain).kurtosis(),
-            
-            # Onset/offset
-            'onset_rate': (pain[10] - pain[0]) / 10 if len(pain) > 10 else 0,
-            'offset_rate': (pain[-1] - pain[-10]) / 10 if len(pain) > 10 else 0,
-        }
-        
-        trials.append(features)
-    
-    features_df = pd.DataFrame(trials)
-    
-    # Add target label if Condition is present
-    if 'Condition' in features_df.columns:
-        features_df['true_label'] = (features_df['Condition'].str.lower().str.contains('tend')).astype(int)
-    
-    return features_df
+def run_c3d_to_trc_subprocess(c3d_path: str, trc_path: str) -> None:
+    script_path = Path(__file__).with_name("c3d_to_trc.py")
+    result = subprocess.run(
+        [sys.executable, str(script_path), c3d_path, trc_path],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "C3D conversion failed").strip())
 
 
-@st.cache_resource
-def load_saved_model(path='model_temporal.joblib'):
-    p = Path(path)
-    if not p.exists():
-        return None
-    return joblib.load(p)
+def run_ik_subprocess(trc_path: str, results_dir: str) -> str:
+    script_path = Path(__file__).with_name("run_opensim_batch.py")
+    result = subprocess.run(
+        [sys.executable, str(script_path), trc_path, results_dir],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "IK run failed").strip())
+
+    ik_path = os.path.join(results_dir, f"{Path(trc_path).stem}_ik.mot")
+    if not os.path.exists(ik_path):
+        raise RuntimeError(f"IK completed but output not found: {ik_path}")
+    return ik_path
 
 
-@st.cache_resource
-def load_saved_scaler(path='scaler_temporal.joblib'):
-    p = Path(path)
-    if not p.exists():
-        return None
-    return joblib.load(p)
+def pick_primary_sto(sto_paths: list[str]) -> str:
+    """Pick most likely force .sto output."""
+    if not sto_paths:
+        raise RuntimeError("No .sto files were generated by Static Optimization.")
+    for p in sto_paths:
+        name = os.path.basename(p).lower()
+        if "force" in name or "staticoptimization" in name:
+            return p
+    return sto_paths[0]
 
 
-def predict_df(model_obj, scaler_obj, df, prob_col_name='prob_tendinopathy'):
-    model = model_obj['model']
-    features = model_obj['features']
-    
-    # Try to get scaler from model_obj first (new format), fall back to scaler_obj parameter
-    if 'scaler' in model_obj:
-        scaler = model_obj['scaler']
-    else:
-        scaler = scaler_obj
-    
-    X = df[features]
-    
-    # Apply scaler if available (temporal model requires scaling)
-    if scaler is not None:
-        X_scaled = scaler.transform(X)
-    else:
-        X_scaled = X
-    
-    proba = model.predict_proba(X_scaled)[:, 1]
-    pred = (proba >= 0.5).astype(int)
-    out = df.copy()
-    out[prob_col_name] = proba
-    out['pred_tendinopathy'] = pred
-    return out
+def _register_numpy_core_compat() -> None:
+    try:
+        import numpy.core as numpy_core
+
+        sys.modules.setdefault("numpy._core", numpy_core)
+        for submodule in (
+            "multiarray",
+            "numeric",
+            "umath",
+            "overrides",
+            "shape_base",
+            "fromnumeric",
+            "function_base",
+            "arrayprint",
+            "defchararray",
+            "records",
+            "einsumfunc",
+            "machar",
+            "getlimits",
+            "_methods",
+            "_multiarray_umath",
+        ):
+            try:
+                module = __import__(f"numpy.core.{submodule}", fromlist=["*"])
+                sys.modules.setdefault(f"numpy._core.{submodule}", module)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
-@st.cache_resource
-def load_test_results(path='results/test_results_temporal.csv'):
+def load_model_bundle(path: str = "model_temporal.joblib"):
     p = Path(path)
     if not p.exists():
         return None
     try:
-        return pd.read_csv(p)
-    except Exception:
+        _register_numpy_core_compat()
+        return joblib.load(p)
+    except Exception as exc:
+        st.warning(
+            f"Could not load {p.name}: {exc}. "
+            "The app will still run, but ML prediction will be disabled until the model is retrained or resaved in this environment."
+        )
         return None
 
 
-def evaluation_panel(df):
-    st.header('Evaluation: Test set')
+def predict_from_temporal_features(model_obj, features_df):
+    model = model_obj["model"]
+    scaler = model_obj.get("scaler")
+    feature_names = model_obj["features"]
 
-    st.write('Rows in test set:', len(df))
+    for col in feature_names:
+        if col not in features_df.columns:
+            features_df[col] = 0.0
 
-    # determine columns
-    prob_col = None
-    if 'prob' in df.columns:
-        prob_col = 'prob'
-    elif 'prob_tendinopathy' in df.columns:
-        prob_col = 'prob_tendinopathy'
+    x = features_df[feature_names]
+    x_scaled = scaler.transform(x) if scaler is not None else x
 
-    if 'true_label' not in df.columns and 'true' in df.columns:
-        df = df.rename(columns={'true': 'true_label'})
+    proba = model.predict_proba(x_scaled)[:, 1]
+    pred = (proba >= 0.5).astype(int)
 
-    if 'true_label' not in df.columns:
-        st.warning('No true labels found in test set (no `true_label` column). Metrics unavailable.')
-        st.dataframe(df.head())
-        return
-
-    y_true = df['true_label'].astype(int).values
-
-    # default threshold slider
-    if prob_col is not None:
-        probs = df[prob_col].astype(float).values
-        thresh = st.slider('Classification threshold', 0.0, 1.0, 0.5)
-        y_pred = (probs >= thresh).astype(int)
-    elif 'pred' in df.columns:
-        y_pred = df['pred'].astype(int).values
-        probs = None
-        thresh = None
-    else:
-        st.warning('No probability or prediction column found. Cannot compute metrics.')
-        st.dataframe(df.head())
-        return
-
-    # metrics
-    acc = accuracy_score(y_true, y_pred)
-    prec = precision_score(y_true, y_pred, zero_division=0)
-    rec = recall_score(y_true, y_pred, zero_division=0)
-    f1 = f1_score(y_true, y_pred, zero_division=0)
-
-    cols = st.columns(4)
-    cols[0].metric('Accuracy', f'{acc:.3f}')
-    cols[1].metric('Precision', f'{prec:.3f}')
-    cols[2].metric('Recall', f'{rec:.3f}')
-    cols[3].metric('F1', f'{f1:.3f}')
-
-    if probs is not None:
-        try:
-            auc = roc_auc_score(y_true, probs)
-        except Exception:
-            auc = float('nan')
-        brier = brier_score_loss(y_true, probs)
-        st.write(f'ROC AUC: {auc:.3f}  —  Brier score: {brier:.4f}')
-
-    # If plotly isn't available, show instructions and a compact metrics summary
-    if not _HAS_PLOTLY:
-        st.error('The `plotly` package is not installed in this environment. Install it with:')
-        st.code('pip install plotly', language='bash')
-        st.write('Metrics:')
-        st.write(f'Accuracy: {acc:.3f}  Precision: {prec:.3f}  Recall: {rec:.3f}  F1: {f1:.3f}')
-        if probs is not None:
-            try:
-                auc = roc_auc_score(y_true, probs)
-            except Exception:
-                auc = float('nan')
-            brier = brier_score_loss(y_true, probs)
-            st.write(f'ROC AUC: {auc:.3f}  —  Brier score: {brier:.4f}')
-        st.subheader('Test set preview')
-        st.dataframe(df.head())
-        return
-
-    # confusion matrix (plotly)
-    cm = confusion_matrix(y_true, y_pred)
-    fig_cm = px.imshow(cm, text_auto=True, labels=dict(x='Predicted', y='Actual'), x=[0,1], y=[0,1], color_continuous_scale='Blues')
-    st.plotly_chart(fig_cm, use_container_width=True)
-
-    # ROC curve
-    if probs is not None:
-        fpr, tpr, _ = roc_curve(y_true, probs)
-        fig_roc = go.Figure()
-        fig_roc.add_trace(go.Scatter(x=fpr, y=tpr, mode='lines', name='ROC'))
-        fig_roc.add_trace(go.Scatter(x=[0,1], y=[0,1], mode='lines', line=dict(dash='dash'), showlegend=False))
-        fig_roc.update_layout(xaxis_title='False Positive Rate', yaxis_title='True Positive Rate', height=400)
-        st.plotly_chart(fig_roc, use_container_width=True)
-
-        # Precision-Recall
-        precision, recall_vals, _ = precision_recall_curve(y_true, probs)
-        fig_pr = go.Figure()
-        fig_pr.add_trace(go.Scatter(x=recall_vals, y=precision, mode='lines', name='PR'))
-        fig_pr.update_layout(xaxis_title='Recall', yaxis_title='Precision', height=400)
-        st.plotly_chart(fig_pr, use_container_width=True)
-
-        # Probability histogram
-        hist_df = pd.DataFrame({'prob': probs, 'true': y_true, 'pred': y_pred})
-        fig_hist = px.histogram(hist_df, x='prob', color='true', nbins=20, barmode='overlay', opacity=0.7, labels={'true':'True label'})
-        fig_hist.update_layout(height=350)
-        st.plotly_chart(fig_hist, use_container_width=True)
-
-    st.subheader('Test set preview')
-    st.dataframe(df.head())
+    out = features_df.copy()
+    out["prob_tendinopathy"] = proba
+    out["pred_tendinopathy"] = pred
+    return out
 
 
-def plot_shap_explanation(model_obj, scaler_obj, features_df, idx=0):
-    """Generate SHAP waterfall plot for a single prediction"""
-    if not _HAS_SHAP:
-        st.error('SHAP not installed. Run: pip install shap')
+def plot_shap_like_explanation(model_obj, features_df, idx: int = 0):
+    """Coefficient-based SHAP-like plot for logistic regression models."""
+    model = model_obj["model"]
+    scaler = model_obj.get("scaler")
+    feature_names = model_obj["features"]
+
+    x = features_df[feature_names].iloc[[idx]]
+    x_scaled = scaler.transform(x) if scaler is not None else x.values
+    vals = x_scaled[0]
+
+    if not hasattr(model, "coef_"):
         return None
-    
-    model = model_obj['model']
-    feature_names = model_obj['features']
-    
-    # Get scaler
-    if 'scaler' in model_obj:
-        scaler = model_obj['scaler']
-    else:
-        scaler = scaler_obj
-    
-    # Prepare data
-    X = features_df[feature_names].iloc[[idx]]
-    X_scaled = scaler.transform(X) if scaler is not None else X.values
-    X_scaled_flat = X_scaled[0]  # Get 1D array
-    
-    # For LogisticRegression, compute SHAP values from coefficients
-    # SHAP value = coefficient * feature_value (for scaled features with mean=0)
-    coefficients = model.coef_[0]
-    intercept = model.intercept_[0]
-    shap_vals = coefficients * X_scaled_flat
-    
-    # Plot horizontal bar chart of SHAP values
+    shap_vals = model.coef_[0] * vals
+
     import matplotlib.pyplot as plt
+
+    order = np.argsort(np.abs(shap_vals))[::-1][:10]
+    top_vals = shap_vals[order]
+    top_names = [feature_names[i] for i in order]
+    colors = ["#FF6B6B" if v > 0 else "#4ECDC4" for v in top_vals]
+
     fig, ax = plt.subplots(figsize=(10, 6))
-    
-    # Sort by absolute SHAP value
-    sorted_idx = np.argsort(np.abs(shap_vals))[::-1][:10]
-    top_shap = shap_vals[sorted_idx]
-    top_names = [feature_names[i] for i in sorted_idx]
-    
-    colors = ['#FF6B6B' if val > 0 else '#4ECDC4' for val in top_shap]
-    ax.barh(range(len(top_shap)), top_shap, color=colors)
-    ax.set_yticks(range(len(top_shap)))
+    ax.barh(range(len(top_vals)), top_vals, color=colors)
+    ax.set_yticks(range(len(top_vals)))
     ax.set_yticklabels(top_names)
-    ax.set_xlabel('SHAP Value (Impact on Prediction)')
-    ax.set_title('Top 10 Feature Importance')
-    ax.axvline(x=0, color='k', linestyle='--', linewidth=0.8)
+    ax.axvline(0, color="black", linestyle="--", linewidth=0.8)
+    ax.set_xlabel("Contribution")
+    ax.set_title("Top 10 Feature Contributions")
     ax.invert_yaxis()
     plt.tight_layout()
-    
     st.pyplot(fig, clear_figure=True)
     plt.close()
-    
-    # Return top features
-    top_features = pd.DataFrame({
-        'feature': feature_names,
-        'shap_value': shap_vals,
-        'abs_shap': np.abs(shap_vals)
-    }).sort_values('abs_shap', ascending=False).head(10)
-    
-    return top_features
+    return None
 
 
-def plot_pain_curve(raw_event_data, trial_info):
-    """Plot pain vs event cycle"""
-    if not _HAS_PLOTLY:
-        st.error('Plotly not installed. Run: pip install plotly')
-        return
-    
-    pain_values = raw_event_data['Pain_pred'].values
-    cycles = range(len(pain_values))
-    
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=list(cycles), 
-        y=pain_values,
-        mode='lines+markers',
-        name='Pain',
-        line=dict(color='#FF6B6B', width=2),
-        marker=dict(size=4)
-    ))
-    
-    # Add peak pain marker
-    peak_idx = np.argmax(pain_values)
-    fig.add_trace(go.Scatter(
-        x=[peak_idx],
-        y=[pain_values[peak_idx]],
-        mode='markers',
-        name='Peak Pain',
-        marker=dict(size=12, color='red', symbol='star')
-    ))
-    
-    fig.update_layout(
-        title=f"Pain Progression - {trial_info}",
-        xaxis_title="Event Cycle",
-        yaxis_title="Pain Prediction Value",
-        height=400,
-        hovermode='x unified'
-    )
-    
-    st.plotly_chart(fig, use_container_width=True)
+def get_top_feature_table(model_obj, features_df, idx: int = 0):
+    model = model_obj["model"]
+    scaler = model_obj.get("scaler")
+    feature_names = model_obj["features"]
+    x = features_df[feature_names].iloc[[idx]]
+    x_scaled = scaler.transform(x) if scaler is not None else x.values
+    vals = x_scaled[0]
+    if not hasattr(model, "coef_"):
+        return None
+    shap_vals = model.coef_[0] * vals
+    import pandas as pd
+
+    return pd.DataFrame(
+        {
+            "feature": feature_names,
+            "shap_value": shap_vals,
+            "abs_shap": np.abs(shap_vals),
+        }
+    ).sort_values("abs_shap", ascending=False)
 
 
-def generate_llm_explanation(prediction, prob, top_features, trial_info, groq_api_key=None, gemini_api_key=None):
-    """Generate natural language explanation using Groq (primary) or Gemini (fallback) LLM"""
-    
-    # Build prompt
+def generate_llm_explanation(prediction, prob, top_features, trial_info, groq_key, gemini_key):
     condition = "Tendinopathy" if prediction == 1 else "Normal"
     confidence = prob if prediction == 1 else (1 - prob)
-    
-    top_features_text = "\n".join([
-        f"- {row['feature']}: SHAP value = {row['shap_value']:.4f}"
-        for _, row in top_features.head(5).iterrows()
-    ])
-    
-    prompt = f"""You are a clinical biomechanics expert providing a comprehensive tendinopathy classification report.
+    top_text = "\n".join(
+        [
+            f"- {row['feature']}: contribution={row['shap_value']:.4f}"
+            for _, row in top_features.head(5).iterrows()
+        ]
+    )
+    prompt = f"""You are a clinical biomechanics expert.
+Prediction: {condition}
+Confidence: {confidence*100:.1f}%
+Trial: {trial_info}
+Top features:
+{top_text}
 
-**Model Prediction:**
-- Classification: {condition}
-- Confidence: {confidence*100:.1f}%
+Provide:
+1) Clinical interpretation
+2) Why top features matter
+3) Short patient-friendly explanation
+4) Rehab suggestion
+"""
 
-**Trial Information:**
-{trial_info}
-
-**Top Contributing Features (SHAP values):**
-{top_features_text}
-
-**Task:**
-Provide a comprehensive analysis with the following sections:
-
-## 1. CLINICAL INTERPRETATION (for Healthcare Professionals)
-Provide a detailed clinical interpretation of this {condition} prediction with {confidence*100:.1f}% confidence. Explain what this means for patient assessment and diagnosis.
-
-## 2. FEATURE EXPLANATION
-Explain the top 3 biomechanical features that influenced this prediction:
-- What each feature measures (e.g., peak_pain, pain_acceleration)
-- Why high/low values of these features indicate tendinopathy or normal condition
-- The clinical relevance of each feature
-
-## 3. MOVEMENT PHASE ANALYSIS
-Analyze the pain patterns across different movement phases:
-- Early phase pain characteristics
-- Mid-phase pain behavior
-- Late phase pain progression
-- What these patterns suggest about tissue health
-
-## 4. REHABILITATION SUGGESTIONS (if Tendinopathy predicted)
-Provide evidence-based rehabilitation recommendations:
-- Activity modifications
-- Load management strategies
-- Progressive exercise considerations
-- When to seek further clinical evaluation
-(If Normal: suggest general maintenance strategies)
-
-## 5. SIMPLE EXPLANATION (for Patients/Non-Experts)
-Explain the results in simple, non-technical language that a patient without medical background can understand. Avoid jargon and use analogies where helpful.
-
-Keep each section clear, actionable, and evidence-based."""
-
-    # Try Groq API first (primary)
-    if _HAS_OPENAI and groq_api_key and groq_api_key.strip():
+    if _HAS_OPENAI and groq_key:
         try:
-            client = OpenAI(
-                api_key=groq_api_key,
-                base_url="https://api.groq.com/openai/v1"
-            )
-            
-            completion = client.chat.completions.create(
+            client = OpenAI(api_key=groq_key, base_url="https://api.groq.com/openai/v1")
+            resp = client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[
-                    {"role": "system", "content": "You are a clinical biomechanics expert specializing in tendinopathy assessment."},
-                    {"role": "user", "content": prompt}
+                    {"role": "system", "content": "You are a clinical biomechanics expert."},
+                    {"role": "user", "content": prompt},
                 ],
-                temperature=0.7,
-                max_tokens=2000
+                temperature=0.5,
+                max_tokens=1200,
             )
-            
-            return completion.choices[0].message.content, "Groq (Llama-3.1-70b)"
-        except Exception as e:
-            st.warning(f'⚠️ Groq API failed: {e}. Trying Gemini fallback...')
-    
-    # Fallback to Gemini API
-    if not _HAS_GEMINI:
-        st.error('Neither Groq nor Gemini API available. Install: pip install openai google-genai')
-        return None, None
-    
-    if gemini_api_key is None or gemini_api_key.strip() == '':
-        st.warning('No API keys provided. Enter Groq or Gemini API key in the sidebar.')
-        return None, None
-    
-    # Try Gemini models
-    client = genai.Client(api_key=gemini_api_key)
-    
-    model_names = [
-        'gemini-2-0-flash-exp',
-        'gemini-exp-1206',
-        'gemini-2-5-flash-preview',
-        'gemini-1-5-flash',
-        'gemini-1-5-pro',
-        'gemini-3-flash-preview'
-    ]
-    
-    last_error = None
-    
-    for model_name in model_names:
+            return resp.choices[0].message.content, "Groq"
+        except Exception:
+            pass
+
+    if _HAS_GEMINI and gemini_key:
         try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt
-            )
-            result = response.text if hasattr(response, 'text') else str(response)
-            return result, f"Gemini ({model_name})"
-        except Exception as e:
-            last_error = e
-            continue
-    
-    # If all models failed
-    st.error(f'LLM generation failed with all models. Last error: {last_error}')
+            client = genai.Client(api_key=gemini_key)
+            resp = client.models.generate_content(model="gemini-1-5-flash", contents=prompt)
+            text = resp.text if hasattr(resp, "text") else str(resp)
+            return text, "Gemini"
+        except Exception:
+            pass
+
     return None, None
 
 
-def realtime_prediction_mode(model_obj, scaler_obj):
-    """Real-time prediction mode for unlabeled data"""
-    st.header('🔬 Real-time Tendinopathy Prediction')
-    
-    # Groq API key: try .env first, then sidebar input (PRIMARY)
-    st.sidebar.subheader('🤖 AI Configuration')
-    groq_env_key = os.getenv('GROQ_API_KEY', '').strip()
-    if groq_env_key:
-        groq_key = groq_env_key
-        st.sidebar.success('✓ Groq API key loaded from .env (Primary)')
-    else:
-        groq_key = st.sidebar.text_input('Groq API Key (Primary)', type='password', help='Get your key at https://console.groq.com/')
-    
-    # Gemini API key: try .env first, then sidebar input (FALLBACK)
-    gemini_env_key = os.getenv('GEMINI_API_KEY', '').strip()
-    if gemini_env_key:
-        gemini_key = gemini_env_key
-        st.sidebar.info('✓ Gemini API key loaded from .env (Fallback)')
-    else:
-        gemini_key = st.sidebar.text_input('Gemini API Key (Fallback)', type='password', help='Get your key at https://makersuite.google.com/app/apikey')
-    
-    # Create tabs for different input methods
-    tab1, tab2 = st.tabs(["📁 C3D File (Full Automation)", "📊 EventCycle Data (Processed)"])
-    
-    with tab1:
-        st.caption('🚀 Upload C3D motion capture file for complete automated analysis')
-        st.info('**New!** Upload raw C3D files directly - no OpenSim or MATLAB needed')
-        
-        # C3D file upload
-        c3d_uploaded = st.file_uploader('Upload C3D file from motion capture', 
-                                        type=['c3d'], key='c3d_upload')
-        
-        if c3d_uploaded is not None:
-            # Save uploaded file temporarily
-            import tempfile
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.c3d') as tmp_file:
-                tmp_file.write(c3d_uploaded.read())
-                tmp_path = tmp_file.name
-            
-            try:
-                # Import automation pipeline
-                from automation_pipeline import c3d_to_prediction_pipeline
-                
-                st.write('Processing C3D file...')
-                
-                # Optional metadata inputs
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    subject_id = st.number_input('Subject ID', min_value=1, value=1)
-                with col2:
-                    task = st.selectbox('Task', ['WithTask', 'Rest'])
-                with col3:
-                    speed = st.selectbox('Speed', ['Fast', 'Medium', 'Slow'])
-                
-                if st.button('🚀 Run Automated Analysis', type='primary'):
-                    with st.spinner('Running complete pipeline: C3D → Kinematics → Forces → Pain Model → ML Prediction...'):
-                        # Set intermediate_dir to intermediate/<uploaded_file_name_without_ext>
-                        from pathlib import Path
-                        upload_base = Path(c3d_uploaded.name).stem
-                        intermediate_dir = os.path.join('intermediate', upload_base)
-                        os.makedirs(intermediate_dir, exist_ok=True)
-                        result = c3d_to_prediction_pipeline(
-                            tmp_path,
-                            model_obj,
-                            scaler_obj,
-                            condition='unknown',
-                            subject_id=subject_id,
-                            task=task,
-                            speed=speed,
-                            # Pass intermediate_dir for debug saving
-                            intermediate_dir=intermediate_dir
-                        )
-                    
-                    # Display prediction
-                    pred_class = result['prediction']
-                    prob = result['probability']
-                    
-                    st.markdown('---')
-                    st.subheader('🎯 Prediction Results')
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if pred_class == 1:
-                            st.error(f'**Prediction:** TENDINOPATHY')
-                        else:
-                            st.success(f'**Prediction:** NORMAL')
-                    
-                    with col2:
-                        confidence = result['confidence']
-                        st.metric('Confidence', f'{confidence:.1%}')
-                    
-                    # Show pain curve
-                    st.subheader('🔁 Pain Over Movement Cycle')
-                    pain_df = result['pain_cycle_df']
-                    import plotly.graph_objects as go
-                    fig = go.Figure()
-                    fig.add_trace(go.Scatter(
-                        x=pain_df['EventCycle'],
-                        y=pain_df['Pain_pred'],
-                        mode='lines',
-                        line=dict(color='red' if pred_class == 1 else 'green', width=3),
-                        name='Pain'
-                    ))
-                    fig.update_layout(
-                        title='Predicted Pain Over Event Cycle',
-                        xaxis_title='Event Cycle (%)',
-                        yaxis_title='Pain (0-10)',
-                        yaxis_range=[0, 10],
-                        height=400
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    # SHAP explanation
-                    st.subheader('📊 Feature Importance (SHAP)')
-                    features_df = result['temporal_features']
-                    with st.spinner('📊 Calculating SHAP values...'):
-                        top_features = plot_shap_explanation(model_obj, scaler_obj, features_df, idx=0)
-                    
-                    # LLM Explanation
-                    st.subheader('🤖 AI Clinical Report')
-                    trial_info = f"Subject {subject_id}, Task: {task}, Speed: {speed}"
-                    
-                    if top_features is not None:
-                        with st.spinner('🤖 Generating comprehensive clinical report with AI... This may take 10-20 seconds.'):
-                            explanation, api_used = generate_llm_explanation(pred_class, prob, top_features, trial_info, groq_key, gemini_key)
-                        if explanation:
-                            st.success(f'✅ Report generated successfully using {api_used}!')
-                            st.markdown(explanation)
-                        else:
-                            st.error('Failed to generate report. Please check your API keys and try again.')
-                    
-                    # Summary metrics
-                    st.subheader('📈 Summary Metrics')
-                    metrics_col1, metrics_col2, metrics_col3 = st.columns(3)
-                    with metrics_col1:
-                        st.metric('Peak Pain', f"{result['metadata']['peak_pain']:.2f}/10")
-                    with metrics_col2:
-                        st.metric('Mean Pain', f"{result['metadata']['mean_pain']:.2f}/10")
-                    with metrics_col3:
-                        st.metric('Duration', f"{result['metadata']['duration_s']:.1f}s")
-                
-            except Exception as e:
-                st.error(f'Error processing C3D file: {e}')
-                st.info('Make sure ezc3d is installed: pip install ezc3d')
-                import traceback
-                st.code(traceback.format_exc())
-            finally:
-                # Clean up temp file
-                if os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
-    
-    with tab2:
-        st.caption('Upload pre-processed EventCycle data (CSV or Excel) for quick prediction')
-        uploaded = st.file_uploader('Upload EventCycle file (CSV or Excel)', type=['csv', 'xlsx', 'xls'], key='realtime')
-        
-        if uploaded is not None:
-            try:
-                raw_df = read_uploaded_file(uploaded)
-            except Exception as e:
-                st.error(f'Failed to read file: {e}')
-                return
-            
-            st.write(f'**Loaded:** {len(raw_df)} event cycles')
-            
-            # Validate required columns
-            required_cols = ['Subject', 'Task', 'Speed', 'Pain_pred']
-            missing = [c for c in required_cols if c not in raw_df.columns]
-            
-            if missing:
-                st.error(f'Missing required columns: {missing}')
-                st.info('Required: Subject, Task, Speed, EventCycle, Pain_pred')
-                return
-            
-            # Extract temporal features
-            with st.spinner('🔄 Extracting temporal features from event cycles...'):
-                # Add dummy Condition for extraction function
-                if 'Condition' not in raw_df.columns:
-                    raw_df['Condition'] = 'unknown'
-                features_df = extract_temporal_features_from_eventcycle(raw_df)
-            
-            if len(features_df) == 0:
-                st.error('No trials extracted. Check your data format.')
-                return
-            
-            # Predict
-            # Predict
-            if model_obj is not None:
-                for f in model_obj['features']:
-                    if f not in features_df.columns:
-                        features_df[f] = 0
-                
-                preds = predict_df(model_obj, scaler_obj, features_df)
-                
-                # Display each trial
-                for idx, row in preds.iterrows():
-                    with st.container():
-                        st.markdown('---')
-                        
-                        # Trial info
-                        subj = row.get('Subject', 'Unknown')
-                        task = row.get('Task', 'Unknown')
-                        speed = row.get('Speed', 'Unknown')
-                        trial_info = f"Subject {subj}, Task: {task}, Speed: {speed}"
-                        
-                        st.subheader(f"Trial: {trial_info}")
-                        
-                        # 1️⃣ Prediction
-                        prob = row['prob_tendinopathy']
-                        pred_class = int(row['pred_tendinopathy'])
-                        condition = "🔴 **Tendinopathy**" if pred_class == 1 else "🟢 **Normal**"
-                        confidence = prob if pred_class == 1 else (1 - prob)
-                        
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.metric('Prediction', condition)
-                        with col2:
-                            st.metric('Confidence', f'{confidence*100:.1f}%')
-                        
-                        # 2️⃣ SHAP Feature Importance
-                        st.subheader('2️⃣ Feature Importance (SHAP)')
-                        try:
-                            with st.spinner('📊 Calculating feature importance...'):
-                                top_features = plot_shap_explanation(model_obj, scaler_obj, features_df, idx)
-                        except Exception as e:
-                            st.error(f'SHAP explanation failed: {e}')
-                            top_features = None
-                        
-                        # 3️⃣ Pain Curve
-                        st.subheader('3️⃣ Pain Progression')
-                        try:
-                            # Get raw event data for this trial
-                            trial_raw = raw_df[
-                                (raw_df['Subject'] == subj) & 
-                                (raw_df['Task'] == task) & 
-                                (raw_df['Speed'] == speed)
-                            ].sort_values('EventCycle')
-                            plot_pain_curve(trial_raw, trial_info)
-                        except Exception as e:
-                            st.error(f'Pain curve visualization failed: {e}')
-                        
-                        # 4️⃣ LLM Clinical Explanation
-                        st.subheader('4️⃣ Comprehensive Clinical Report (AI-Generated)')
-                        explanation = None
-                        api_used = None
-                        if top_features is not None:
-                            with st.spinner('🤖 Generating comprehensive clinical report with AI... This may take 10-20 seconds.'):
-                                explanation, api_used = generate_llm_explanation(pred_class, prob, top_features, trial_info, groq_key, gemini_key)
-                        if explanation:
-                            st.success(f'✅ Report generated successfully using {api_used}!')
-                            st.markdown(explanation)
-                        else:
-                            st.error('Failed to generate report. Please check your API keys and try again.')
-
-                        
-                        # 5️⃣ Download Report
-                        st.subheader('5️⃣ Download Report')
-                        if top_features is not None:
-                            # Build comprehensive report
-                            report_text = f"""TENDINOPATHY CLASSIFICATION REPORT
-{'='*60}
-
-Trial Information:
-{trial_info}
-
-Prediction Results:
-- Classification: {condition.replace('🔴 **', '').replace('🟢 **', '').replace('**', '')}
-- Confidence: {confidence*100:.1f}%
-- Probability (Tendinopathy): {prob:.3f}
-
-Top 10 Contributing Features (SHAP Analysis):
-"""
-                            for i, feat_row in top_features.iterrows():
-                                report_text += f"  {feat_row['feature']:25s} | SHAP: {feat_row['shap_value']:+.4f} | Importance: {feat_row['abs_shap']:.4f}\n"
-                            
-                            if explanation:
-                                report_text += f"\n\nCOMPREHENSIVE CLINICAL ANALYSIS:\n{'='*60}\n"
-                                if api_used:
-                                    report_text += f"(Generated using: {api_used})\n\n"
-                                report_text += f"{explanation}\n"
-                            
-                            report_text += f"\n\n{'='*60}\nReport Generated: {pd.Timestamp.now()}\n"
-                            
-                            # Download button
-                            st.download_button(
-                                label='📥 Download Complete Report (TXT)',
-                                data=report_text,
-                                file_name=f'tendinopathy_report_{subj}_{task}_{speed}.txt',
-                                mime='text/plain',
-                                key=f'download_txt_{idx}'
-                            )
-                            
-                            # Also create CSV version with key data
-                            csv_data = pd.DataFrame([{
-                                'Subject': subj,
-                                'Task': task,
-                                'Speed': speed,
-                                'Prediction': condition.replace('🔴 **', '').replace('🟢 **', '').replace('**', ''),
-                                'Confidence': f'{confidence*100:.1f}%',
-                                'Prob_Tendinopathy': prob,
-                                'Top_Feature_1': top_features.iloc[0]['feature'] if len(top_features) > 0 else '',
-                                'Top_Feature_1_SHAP': top_features.iloc[0]['shap_value'] if len(top_features) > 0 else 0,
-                                'Top_Feature_2': top_features.iloc[1]['feature'] if len(top_features) > 1 else '',
-                                'Top_Feature_2_SHAP': top_features.iloc[1]['shap_value'] if len(top_features) > 1 else 0,
-                                'Top_Feature_3': top_features.iloc[2]['feature'] if len(top_features) > 2 else '',
-                                'Top_Feature_3_SHAP': top_features.iloc[2]['shap_value'] if len(top_features) > 2 else 0,
-                            }])
-                            
-                            st.download_button(
-                                label='📥 Download Key Metrics (CSV)',
-                                data=csv_data.to_csv(index=False),
-                                file_name=f'tendinopathy_metrics_{subj}_{task}_{speed}.csv',
-                                mime='text/csv',
-                                key=f'download_csv_{idx}'
-                            )
-
-
-def model_evaluation_mode(model_obj, scaler_obj):
-    """Model evaluation mode with labeled data (current functionality)"""
-    st.header('📊 Model Evaluation & Testing')
-    st.caption('Upload data WITH condition labels to evaluate model performance')
-
-    st.header('1) Upload Raw Event-Cycle Data (Recommended)')
-    st.caption('Upload your raw EventCycle CSV with columns: Subject, Condition, Task, Speed, EventCycle, Pain_pred. The app will automatically extract temporal features and predict.')
-    
-    uploaded_raw = st.file_uploader('Upload EventCycle file (CSV or Excel)', type=['csv', 'xlsx', 'xls'], key='raw_upload')
-
-    if uploaded_raw is not None:
-        try:
-            raw_df = read_uploaded_file(uploaded_raw)
-        except Exception as e:
-            st.error(f'Failed to read file: {e}')
-            return
-
-        st.write('**Raw data loaded:**', len(raw_df), 'rows')
-        st.dataframe(raw_df.head())
-
-        # Validate required columns
-        required_cols = ['Subject', 'Condition', 'Task', 'Speed', 'Pain_pred']
-        missing = [c for c in required_cols if c not in raw_df.columns]
-        
-        if missing:
-            st.error(f'Missing required columns: {missing}')
-            st.info('Expected columns: Subject, Condition, Task, Speed, EventCycle, Pain_pred')
-            return
-
-        # Extract temporal features
-        with st.spinner('Extracting temporal features...'):
-            features_df = extract_temporal_features_from_eventcycle(raw_df)
-        
-        st.success(f'✓ Extracted features for {len(features_df)} trials')
-        st.dataframe(features_df.head())
-
-        if model_obj is not None:
-            # Ensure model feature columns exist
-            for f in model_obj['features']:
-                if f not in features_df.columns:
-                    st.warning(f'Model expects feature `{f}` but it is missing. Filling with 0.')
-                    features_df[f] = 0
-
-            preds = predict_df(model_obj, scaler_obj, features_df)
-            st.subheader('Predictions')
-            
-            # Build output columns
-            cols = ['Subject', 'Condition', 'Task', 'Speed']
-            
-            # Check if true labels exist
-            has_true_label = 'true_label' in preds.columns
-            
-            if has_true_label:
-                cols += ['true_label']
-            
-            cols += ['prob_tendinopathy', 'pred_tendinopathy']
-            
-            # Add key features
-            key_features = ['peak_pain', 'mean_pain', 'pain_acceleration', 'time_to_peak']
-            for feat in key_features:
-                if feat in preds.columns and feat not in cols:
-                    cols.append(feat)
-            
-            st.dataframe(preds[cols])
-            
-            # Show metrics if true labels are present
-            if has_true_label:
-                st.subheader('Performance Metrics')
-                y_true = preds['true_label'].astype(int).values
-                y_prob = preds['prob_tendinopathy'].values
-                y_pred = preds['pred_tendinopathy'].astype(int).values
-                
-                acc = accuracy_score(y_true, y_pred)
-                prec = precision_score(y_true, y_pred, zero_division=0)
-                rec = recall_score(y_true, y_pred, zero_division=0)
-                f1 = f1_score(y_true, y_pred, zero_division=0)
-                
-                cols_metric = st.columns(4)
-                cols_metric[0].metric('Accuracy', f'{acc:.3f}')
-                cols_metric[1].metric('Precision', f'{prec:.3f}')
-                cols_metric[2].metric('Recall', f'{rec:.3f}')
-                cols_metric[3].metric('F1 Score', f'{f1:.3f}')
-                
-                try:
-                    auc = roc_auc_score(y_true, y_prob)
-                    st.write(f'**ROC AUC:** {auc:.3f}')
-                except Exception:
-                    pass
-            
-            # Download predictions
-            csv_output = preds[cols].to_csv(index=False)
-            st.download_button(
-                label='Download predictions as CSV',
-                data=csv_output,
-                file_name='tendinopathy_predictions.csv',
-                mime='text/csv'
-            )
-
-    st.header('2) Upload Temporal Features Data (Advanced)')
-    st.caption('Upload a file with 23 temporal features extracted from EventCycle data. Use extract_temporal_features.py to generate this from raw EventCycle CSV/Excel.')
-    uploaded = st.file_uploader('Upload temporal features file (CSV or Excel)', type=['csv', 'xlsx', 'xls'])
-
-    if uploaded is not None:
-        try:
-            data_df = read_uploaded_file(uploaded)
-        except Exception as e:
-            st.error(f'Failed to read file: {e}')
-            return
-
-        st.write('Rows:', len(data_df))
-        st.dataframe(data_df.head())
-
-        if model_obj is not None:
-            # ensure model feature columns exist
-            for f in model_obj['features']:
-                if f not in data_df.columns:
-                    st.warning(f'Model expects feature `{f}` but it is missing. Filling with 0.')
-                    data_df[f] = 0
-
-            preds = predict_df(model_obj, scaler_obj, data_df)
-            st.subheader('Predictions')
-            
-            # Build output columns
-            cols = []
-            if 'Subject' in preds.columns:
-                cols += ['Subject']
-            if 'Condition' in preds.columns:
-                cols += ['Condition']
-            
-            # Check if true labels exist
-            has_true_label = False
-            true_label_col = None
-            if 'true_label' in preds.columns:
-                true_label_col = 'true_label'
-                has_true_label = True
-            elif 'target' in preds.columns:
-                true_label_col = 'target'
-                has_true_label = True
-            elif 'label' in preds.columns:
-                true_label_col = 'label'
-                has_true_label = True
-            
-            if has_true_label:
-                cols += [true_label_col]
-            
-            cols += ['prob_tendinopathy', 'pred_tendinopathy']
-            
-            # Add key features at the end
-            key_features = ['peak_pain', 'mean_pain', 'pain_acceleration', 'time_to_peak']
-            for feat in key_features:
-                if feat in preds.columns and feat not in cols:
-                    cols.append(feat)
-            
-            st.dataframe(preds[cols])
-            
-            # Show metrics if true labels are present
-            if has_true_label:
-                st.subheader('Performance Metrics')
-                y_true = preds[true_label_col].astype(int).values
-                y_prob = preds['prob_tendinopathy'].values
-                y_pred = preds['pred_tendinopathy'].astype(int).values
-                
-                acc = accuracy_score(y_true, y_pred)
-                prec = precision_score(y_true, y_pred, zero_division=0)
-                rec = recall_score(y_true, y_pred, zero_division=0)
-                f1 = f1_score(y_true, y_pred, zero_division=0)
-                
-                cols_metric = st.columns(4)
-                cols_metric[0].metric('Accuracy', f'{acc:.3f}')
-                cols_metric[1].metric('Precision', f'{prec:.3f}')
-                cols_metric[2].metric('Recall', f'{rec:.3f}')
-                cols_metric[3].metric('F1 Score', f'{f1:.3f}')
-                
-                try:
-                    auc = roc_auc_score(y_true, y_prob)
-                    st.write(f'**ROC AUC:** {auc:.3f}')
-                except Exception:
-                    pass
-
-    st.header('3) Model Evaluation (Interactive)')
-    st.write('Load the `test_results_temporal.csv` from training, or upload your own test file with `true_label` and `prob`/`pred` columns.')
-
-    # Option to load bundled test_results_temporal.csv or upload
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        if st.button('Load test_results_temporal.csv'):
-            test_df = load_test_results('results/test_results_temporal.csv')
-        else:
-            test_df = None
-    with col2:
-        uploaded_test = st.file_uploader('Or upload test file (CSV or Excel)', type=['csv', 'xlsx', 'xls'], key='test_upload')
-        if uploaded_test is not None:
-            try:
-                test_df = read_uploaded_file(uploaded_test)
-            except Exception as e:
-                st.error(f'Failed to read uploaded test file: {e}')
-                test_df = None
-
-    if test_df is not None:
-        evaluation_panel(test_df)
-
-
-def main():
-    """Main function with sidebar mode selector"""
-    st.set_page_config(page_title='Tendinopathy Classifier', page_icon='🏥', layout='wide')
-    
-    # Sidebar: Mode selection
-    st.sidebar.title('🏥 Tendinopathy Classifier')
-    mode = st.sidebar.radio(
-        'Select Mode',
-        ['Real-time Prediction', 'Model Evaluation'],
-        help='**Real-time**: Predict on unlabeled data with SHAP explainability and LLM insights\n\n**Evaluation**: Test model performance on labeled data'
+def main() -> None:
+    st.set_page_config(page_title="OpenSim Tendinopathy Pipeline", page_icon="🏥", layout="wide")
+    st.title("🏥 OpenSim-Only C3D Pipeline")
+    st.caption(
+        "Flow: C3D -> TRC -> Inverse Kinematics (.mot) -> Static Optimization (.sto) "
+        "-> Python port of your MATLAB pain model -> EventCycle CSV"
     )
-    
-    # Load model once
-    st.sidebar.header('Model Status')
-    model_obj = load_saved_model('model_temporal.joblib')
-    scaler_obj = load_saved_scaler('scaler_temporal.joblib')
-    
+    st.warning(
+        "The simplified direct method is removed. Only OpenSim + converted pain model path runs."
+    )
+    st.sidebar.subheader("AI Configuration (optional)")
+    groq_key = st.sidebar.text_input("Groq API Key", type="password")
+    gemini_key = st.sidebar.text_input("Gemini API Key", type="password")
+    model_obj = load_model_bundle("model_temporal.joblib")
     if model_obj is None:
-        st.sidebar.error('❌ No model found')
-        st.error('Model file `model_temporal.joblib` not found. Run `train_temporal_model.py` first.')
+        st.error("`model_temporal.joblib` not found. Train/load model before running classification.")
+    else:
+        st.success("Temporal classifier model loaded.")
+
+    c3d_file = st.file_uploader("Upload C3D file", type=["c3d"])
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        subject = st.number_input("Subject ID", min_value=1, value=1, step=1)
+    with col2:
+        condition = st.selectbox("Condition", ["normal", "tendon"], index=0)
+    with col3:
+        task = st.selectbox("Task", ["WithTask", "Rest"], index=0)
+    with col4:
+        speed = st.selectbox("Speed", ["Fast", "Medium", "Slow"], index=1)
+
+    if c3d_file is None:
+        st.info("Upload a C3D file to start.")
         return
-    else:
-        st.sidebar.success('✓ Model loaded')
-        st.sidebar.info(f'Features: {len(model_obj["features"])} temporal features')
-        st.sidebar.caption('Model: Logistic Regression with L2 regularization')
-        
-        # Check scaler
-        if 'scaler' in model_obj:
-            st.sidebar.success('✓ Scaler included')
-        elif scaler_obj is not None:
-            st.sidebar.success('✓ Scaler loaded (legacy)')
-        else:
-            st.sidebar.warning('⚠ No scaler found')
-    
-    # Route to appropriate mode
-    if mode == 'Real-time Prediction':
-        realtime_prediction_mode(model_obj, scaler_obj)
-    else:
-        model_evaluation_mode(model_obj, scaler_obj)
+
+    trial = Path(c3d_file.name).stem
+    trial_dir = Path("intermediate") / trial
+    trial_dir.mkdir(parents=True, exist_ok=True)
+
+    if st.button("Run OpenSim Pipeline", type="primary"):
+        status = st.status("Starting pipeline...", expanded=True)
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".c3d") as tmp:
+                tmp.write(c3d_file.read())
+                c3d_tmp_path = tmp.name
+
+            trc_path = str(trial_dir / f"{trial}.trc")
+
+            status.write("Converting C3D to TRC...")
+            try:
+                run_c3d_to_trc_subprocess(c3d_tmp_path, trc_path)
+            except Exception as exc:
+                raise RuntimeError(f"C3D to TRC conversion failed for {c3d_file.name}: {exc}")
+            status.write(f"TRC generated: {trc_path}")
+
+            status.write("Running Inverse Kinematics...")
+            try:
+                ik_path = run_ik_subprocess(trc_path, str(trial_dir))
+            except Exception as exc:
+                raise RuntimeError(f"IK failed for {c3d_file.name}: {exc}")
+            status.write(f"IK MOT generated: {ik_path}")
+
+            status.write("Running Static Optimization...")
+            sto_paths = run_static_optimization(trial, ik_path, str(trial_dir))
+            primary_sto = pick_primary_sto(sto_paths)
+            status.write(f"Static Optimization completed: {primary_sto}")
+
+            event_cycle_csv = str(trial_dir / "event_cycle.csv")
+            summary_csv = str(trial_dir / "summary.csv")
+
+            status.write("Calculating event-cycle pain data...")
+            event_df, summary_df, _ = compute_event_cycle_from_sto(
+                sto_path=primary_sto,
+                subject=subject,
+                condition=condition,
+                task=task,
+                speed=speed,
+            )
+            event_df.to_csv(event_cycle_csv, index=False)
+            summary_df.to_csv(summary_csv, index=False)
+            status.write(f"EventCycle CSV generated: {event_cycle_csv}")
+
+            status.write("Extracting temporal features...")
+            temporal_features_df = extract_temporal_features_from_event_cycle(event_df)
+            temporal_features_csv = str(trial_dir / "temporal_features.csv")
+            temporal_features_df.to_csv(temporal_features_csv, index=False)
+            status.write(f"Temporal features generated: {temporal_features_csv}")
+
+            prediction_df = None
+            prediction_csv = str(trial_dir / "prediction.csv")
+            if model_obj is not None:
+                status.write("Running ML prediction...")
+                prediction_df = predict_from_temporal_features(model_obj, temporal_features_df)
+                prediction_df.to_csv(prediction_csv, index=False)
+                status.write(f"Prediction CSV generated: {prediction_csv}")
+
+            status.update(label="Pipeline completed successfully.", state="complete", expanded=False)
+            st.success("Pipeline completed successfully.")
+            st.write(f"TRC: `{trc_path}`")
+            st.write(f"IK: `{ik_path}`")
+            st.write(f"Primary STO: `{primary_sto}`")
+            st.write(f"EventCycle CSV: `{event_cycle_csv}`")
+            st.write(f"Summary CSV: `{summary_csv}`")
+            st.write(f"Temporal Features CSV: `{temporal_features_csv}`")
+            if prediction_df is not None:
+                st.write(f"Prediction CSV: `{prediction_csv}`")
+
+                st.subheader("Generated EventCycle CSV preview")
+                st.dataframe(event_df.head(20), use_container_width=True)
+                st.subheader("Generated Summary CSV preview")
+                st.dataframe(summary_df, use_container_width=True)
+                st.subheader("Generated Temporal Features preview")
+                st.dataframe(temporal_features_df, use_container_width=True)
+
+                if prediction_df is not None:
+                    st.subheader("Classification Result")
+                    row = prediction_df.iloc[0]
+                    pred_label = "TENDINOPATHY" if int(row["pred_tendinopathy"]) == 1 else "NORMAL"
+                    prob = float(row["prob_tendinopathy"])
+                    confidence = prob if int(row["pred_tendinopathy"]) == 1 else (1.0 - prob)
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if pred_label == "TENDINOPATHY":
+                            st.error(f"Prediction: {pred_label}")
+                        else:
+                            st.success(f"Prediction: {pred_label}")
+                    with c2:
+                        st.metric("Confidence", f"{confidence:.1%}")
+                    st.dataframe(
+                        prediction_df[
+                            [
+                                "Subject",
+                                "Condition",
+                                "Task",
+                                "Speed",
+                                "prob_tendinopathy",
+                                "pred_tendinopathy",
+                            ]
+                        ],
+                        use_container_width=True,
+                    )
+
+                    st.subheader("SHAP-like Feature Explanation")
+                    top_features = get_top_feature_table(model_obj, temporal_features_df, idx=0)
+                    if top_features is not None:
+                        plot_shap_like_explanation(model_obj, temporal_features_df, idx=0)
+                        st.dataframe(top_features.head(10), use_container_width=True)
+
+                        st.subheader("LLM Clinical Report")
+                        trial_info = f"Subject {subject}, Task: {task}, Speed: {speed}"
+                        with st.spinner("Generating report..."):
+                            explanation, api_used = generate_llm_explanation(
+                                int(row["pred_tendinopathy"]),
+                                float(row["prob_tendinopathy"]),
+                                top_features,
+                                trial_info,
+                                groq_key.strip(),
+                                gemini_key.strip(),
+                            )
+                        if explanation:
+                            st.success(f"Report generated using {api_used}")
+                            st.markdown(explanation)
+                        else:
+                            st.info("Provide Groq/Gemini key in sidebar to generate LLM report.")
+
+                st.subheader("Downloads")
+                with open(trc_path, "rb") as f:
+                    st.download_button(
+                        "Download TRC",
+                        data=f.read(),
+                        file_name=os.path.basename(trc_path),
+                        mime="text/plain",
+                    )
+                with open(ik_path, "rb") as f:
+                    st.download_button(
+                        "Download IK MOT",
+                        data=f.read(),
+                        file_name=os.path.basename(ik_path),
+                        mime="text/plain",
+                    )
+                for sto_path in sto_paths:
+                    with open(sto_path, "rb") as f:
+                        st.download_button(
+                            f"Download STO ({os.path.basename(sto_path)})",
+                            data=f.read(),
+                            file_name=os.path.basename(sto_path),
+                            mime="text/plain",
+                            key=f"sto_{os.path.basename(sto_path)}",
+                        )
+                st.download_button(
+                    "Download EventCycle CSV",
+                    data=event_df.to_csv(index=False),
+                    file_name=f"{trial}_event_cycle.csv",
+                    mime="text/csv",
+                )
+                st.download_button(
+                    "Download Summary CSV",
+                    data=summary_df.to_csv(index=False),
+                    file_name=f"{trial}_summary.csv",
+                    mime="text/csv",
+                )
+                st.download_button(
+                    "Download Temporal Features CSV",
+                    data=temporal_features_df.to_csv(index=False),
+                    file_name=f"{trial}_temporal_features.csv",
+                    mime="text/csv",
+                )
+                if prediction_df is not None:
+                    st.download_button(
+                        "Download Prediction CSV",
+                        data=prediction_df.to_csv(index=False),
+                        file_name=f"{trial}_prediction.csv",
+                        mime="text/csv",
+                    )
+
+        except subprocess.CalledProcessError as e:
+                st.error(f"External command failed: {e}")
+        except Exception as e:
+                st.error(f"Pipeline failed: {e}")
+        finally:
+            if "c3d_tmp_path" in locals() and os.path.exists(c3d_tmp_path):
+                os.unlink(c3d_tmp_path)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

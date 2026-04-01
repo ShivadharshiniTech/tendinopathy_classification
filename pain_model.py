@@ -79,8 +79,11 @@ class PainModel:
         # Ensure non-negative
         Fe_cycle = np.maximum(Fe_cycle, 0)
         
-        # Apply median filter for smoothing (window size 5)
-        Fe_cycle = medfilt(Fe_cycle, kernel_size=5)
+        # Apply median filter for smoothing (window size 5) with edge padding to match MATLAB movmedian
+        pad_width = 2  # (kernel_size - 1) // 2
+        Fe_cycle_padded = np.pad(Fe_cycle, (pad_width, pad_width), mode='edge')
+        Fe_cycle_smoothed = medfilt(Fe_cycle_padded, kernel_size=5)
+        Fe_cycle = Fe_cycle_smoothed[pad_width:-pad_width]
         
         return Fe_cycle
     

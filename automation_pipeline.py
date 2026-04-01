@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 # Import our custom modules
-from c3d_reader import read_c3d_file
+from c3d_reader import read_c3d_file, save_as_trc
 from biomechanics import process_marker_data_to_forces
 from pain_model import PainModel
 from extract_temporal_features import extract_temporal_features_from_event_cycle
@@ -18,15 +18,14 @@ def c3d_to_prediction_pipeline(c3d_filepath, model_obj, scaler_obj,
                                condition='unknown', subject_id=1,
                                task=None, speed=None, intermediate_dir=None):
     print(f"[DEBUG] c3d_to_prediction_pipeline called with intermediate_dir={intermediate_dir}")
-    """
-    Complete automated pipeline: C3D file → Tendinopathy prediction
-    
+    """Complete automated pipeline: C3D file → Tendinopathy prediction
+
     Traditional workflow:
         C3D → Mokka → TRC → OpenSim IK → OpenSim SO → Excel → MATLAB → CSV → ML
-    
+
     Automated workflow:
         C3D → Python biomechanics → Pain model → Feature extraction → ML prediction
-    
+
     Args:
         c3d_filepath: Path to C3D motion capture file
         model_obj: Trained ML model dict
@@ -35,7 +34,7 @@ def c3d_to_prediction_pipeline(c3d_filepath, model_obj, scaler_obj,
         subject_id: Subject identifier
         task: Task type description
         speed: Movement speed
-    
+
     Returns:
         dict with:
             - prediction: 0 (Normal) or 1 (Tendinopathy)
@@ -48,7 +47,16 @@ def c3d_to_prediction_pipeline(c3d_filepath, model_obj, scaler_obj,
     print(f"\n{'='*60}")
     print("AUTOMATED C3D → TENDINOPATHY PREDICTION")
     print(f"{'='*60}")
-    
+
+    # Determine per-trial intermediate directory
+    input_base = Path(c3d_filepath).stem
+    if intermediate_dir is None:
+        intermediate_dir = Path("intermediate") / input_base
+    else:
+        intermediate_dir = Path(intermediate_dir)
+    os.makedirs(intermediate_dir, exist_ok=True)
+    print(f"[DEBUG] Saving intermediates for this trial under: {intermediate_dir}")
+
     # --- Parse Task and Speed from filename (match MATLAB logic) ---
     fname = Path(c3d_filepath).name.lower()
     # Task
@@ -80,6 +88,14 @@ def c3d_to_prediction_pipeline(c3d_filepath, model_obj, scaler_obj,
         print(f"  ✓ Frame rate: {c3d_data['frame_rate']:.1f} Hz")
         print(f"  ✓ Duration: {c3d_data['time'][-1]:.2f} seconds")
         print(f"  ✓ Markers: {', '.join(c3d_data['marker_names'][:5])}...")
+        
+        # Save TRC representation of the markers for reference
+        try:
+            trc_path = intermediate_dir / f"{input_base}.trc"
+            save_as_trc(c3d_data, str(trc_path))
+            print(f"  ✓ Saved TRC file to {trc_path}")
+        except Exception as trc_err:
+            print(f"  ⚠️ Failed to save TRC file: {trc_err}")
     except Exception as e:
         raise RuntimeError(f"Failed to read C3D file: {e}")
     
@@ -98,6 +114,14 @@ def c3d_to_prediction_pipeline(c3d_filepath, model_obj, scaler_obj,
         print(f"  ✓ Mean ECU: {forces_df['ECU_N'].mean():.1f}N")
         print(f"  ✓ Mean ECRL: {forces_df['ECRL_N'].mean():.1f}N")
         print(f"  ✓ Mean ECRB: {forces_df['ECRB_N'].mean():.1f}N")
+        
+        # Save muscle force time series for this trial
+        try:
+            forces_path = intermediate_dir / "muscle_forces.csv"
+            forces_df.to_csv(forces_path, index=False)
+            print(f"  ✓ Saved muscle forces to {forces_path}")
+        except Exception as forces_err:
+            print(f"  ⚠️ Failed to save muscle forces CSV: {forces_err}")
     except Exception as e:
         raise RuntimeError(f"Failed to estimate muscle forces: {e}")
     
@@ -112,7 +136,7 @@ def c3d_to_prediction_pipeline(c3d_filepath, model_obj, scaler_obj,
             subject_id=subject_id,
             task=task_val,
             speed=speed_val,
-            intermediate_dir=intermediate_dir
+            intermediate_dir=str(intermediate_dir)
         )
         print(f"  ✓ Computed pain over 101-point event cycle")
         print(f"  ✓ Peak pain: {pain_cycle_df['Pain_pred'].max():.2f}/10")
@@ -164,11 +188,6 @@ def c3d_to_prediction_pipeline(c3d_filepath, model_obj, scaler_obj,
     
     # Step 6: Package results and save intermediates
     print("\n[6/6] Packaging results and saving intermediates...")
-
-    # Create intermediate output directory for this file
-    input_base = Path(c3d_filepath).stem
-    intermediate_dir = Path("intermediate") / input_base
-    os.makedirs(intermediate_dir, exist_ok=True)
 
     # Save event-cycle data
     pain_cycle_path = intermediate_dir / "event_cycle.csv"
