@@ -2,6 +2,7 @@ import os
 import subprocess
 import tempfile
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import joblib
@@ -27,39 +28,144 @@ except Exception:
     _HAS_GEMINI = False
 
 
-def run_static_optimization(trial_name: str, ik_path: str, output_dir: str) -> list[str]:
+def run_static_optimization(
+    trial_name: str,
+    ik_path: str,
+    output_dir: str,
+    log_callback=None,
+) -> list[str]:
     """Run OpenSim Static Optimization for one IK result and return .sto outputs."""
     template_path = pick_template_for_trial(trial_name)
     if not os.path.isfile(template_path):
         raise FileNotFoundError(f"Template not found: {template_path}")
 
+    def get_mot_time_range(mot_file: str) -> tuple[float, float]:
+        with open(mot_file, "r", encoding="utf-8") as f:
+            data_lines = [line.strip() for line in f.readlines() if line.strip()]
+
+        numeric_rows = []
+        for line in data_lines:
+            first_token = line.split()[0]
+            try:
+                float(first_token)
+                numeric_rows.append(line)
+            except ValueError:
+                continue
+
+        if not numeric_rows:
+            raise RuntimeError(f"No numeric data rows found in IK file: {mot_file}")
+
+        start_time = float(numeric_rows[0].split()[0])
+        end_time = float(numeric_rows[-1].split()[0])
+        return start_time, end_time
+
+    def get_trial_side(name: str) -> str:
+        lowered = name.lower()
+        if "_left" in lowered:
+            return "left"
+        if "_right" in lowered:
+            return "right"
+        return "right"
+
+    def build_tuned_model_copy(base_model_path: Path, trial_name: str) -> Path:
+        trial_side = get_trial_side(trial_name)
+        locked_side = "right" if trial_side == "left" else "left"
+        tuned_model_path = base_model_path.with_name(f"{base_model_path.stem}_tuned_{trial_name}.osim")
+
+        lock_coords = {
+            "pelvis_tilt",
+            "pelvis_list",
+            "pelvis_rotation",
+            "pelvis_tx",
+            "pelvis_ty",
+            "pelvis_tz",
+            "lumbar_extension",
+            "lumbar_bending",
+            "lumbar_rotation",
+            f"arm_flex_{locked_side[0]}",
+            f"arm_add_{locked_side[0]}",
+            f"arm_rot_{locked_side[0]}",
+            f"elbow_flex_{locked_side[0]}",
+            f"pro_sup_{locked_side[0]}",
+            f"wrist_flex_{locked_side[0]}",
+            f"wrist_dev_{locked_side[0]}",
+        }
+
+        tree = ET.parse(base_model_path)
+        root = tree.getroot()
+
+        for coordinate in root.findall(".//Coordinate"):
+            coordinate_name = coordinate.get("name")
+            if coordinate_name in lock_coords:
+                locked_element = coordinate.find("locked")
+                if locked_element is not None:
+                    locked_element.text = "true"
+
+        # Convergence-oriented tuning: give the optimizer a little more muscle reserve.
+        for muscle in root.findall(".//Millard2012EquilibriumMuscle"):
+            force_element = muscle.find("max_isometric_force")
+            if force_element is None or force_element.text is None:
+                continue
+            try:
+                force_value = float(force_element.text)
+            except ValueError:
+                continue
+            force_element.text = f"{force_value * 1.5:.10f}"
+
+        tree.write(tuned_model_path, encoding="utf-8", xml_declaration=True)
+        return tuned_model_path
+
     base_dir = Path(__file__).resolve().parent
     abs_output_dir = Path(output_dir).resolve()
-    if "_nor_" in trial_name.lower():
-        model_path = base_dir / "osim models" / "Elbow_model_load.osim"
-    else:
-        model_path = base_dir / "osim models" / "Elbow_model.osim"
+    base_model_path = base_dir / "osim models" / ("Elbow_model_load.osim" if "_nor_" in trial_name.lower() else "Elbow_model.osim")
+
+    if log_callback is not None:
+        log_callback(f"Tuning model for convergence: {base_model_path.name}")
+    tuned_model_path = build_tuned_model_copy(base_model_path, trial_name)
+    if log_callback is not None:
+        log_callback(f"Tuned model copy created: {tuned_model_path}")
+
+    start_time, end_time = get_mot_time_range(ik_path)
 
     with open(template_path, "r", encoding="utf-8") as f:
         xml_text = f.read()
 
     xml_text = xml_text.replace("muscle_forces_result", abs_output_dir.as_posix())
-    xml_text = xml_text.replace("osim models/Elbow_model_load.osim", model_path.as_posix())
-    xml_text = xml_text.replace("osim models/Elbow_model.osim", model_path.as_posix())
+    xml_text = xml_text.replace("osim models/Elbow_model_load.osim", tuned_model_path.as_posix())
+    xml_text = xml_text.replace("osim models/Elbow_model.osim", tuned_model_path.as_posix())
     xml_text = xml_text.replace(TEMPLATE_IK_NAME, os.path.basename(ik_path))
+    xml_text = xml_text.replace("<initial_time>0</initial_time>", f"<initial_time>{start_time}</initial_time>")
+    xml_text = xml_text.replace("<final_time>30.484000000000002</final_time>", f"<final_time>{end_time}</final_time>")
+    xml_text = xml_text.replace("<start_time>0</start_time>", f"<start_time>{start_time}</start_time>")
+    xml_text = xml_text.replace("<end_time>30.484000000000002</end_time>", f"<end_time>{end_time}</end_time>")
+    xml_text = xml_text.replace("<optimizer_convergence_criterion>0.0001</optimizer_convergence_criterion>", "<optimizer_convergence_criterion>0.001</optimizer_convergence_criterion>")
+    xml_text = xml_text.replace("<optimizer_max_iterations>100</optimizer_max_iterations>", "<optimizer_max_iterations>250</optimizer_max_iterations>")
 
     trial_xml_path = abs_output_dir / f"setup_static_{trial_name}.xml"
     with open(trial_xml_path, "w", encoding="utf-8") as f:
         f.write(xml_text)
 
-    result = subprocess.run(
-        ["opensim-cmd", "run-tool", str(trial_xml_path)],
-        check=False,
-        capture_output=True,
+    command = ["opensim-cmd", "run-tool", str(trial_xml_path)]
+    if log_callback is not None:
+        log_callback(f"Running: {' '.join(command)}")
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,
     )
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout or "OpenSim Static Optimization failed").strip())
+    output_lines = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        clean_line = line.rstrip()
+        if clean_line:
+            output_lines.append(clean_line)
+            if log_callback is not None:
+                log_callback(clean_line)
+    return_code = process.wait()
+    if return_code != 0:
+        raise RuntimeError("\n".join(output_lines) or "OpenSim Static Optimization failed")
 
     sto_paths = []
     for name in os.listdir(abs_output_dir):
@@ -345,7 +451,7 @@ def main() -> None:
             status.write(f"IK MOT generated: {ik_path}")
 
             status.write("Running Static Optimization...")
-            sto_paths = run_static_optimization(trial, ik_path, str(trial_dir))
+            sto_paths = run_static_optimization(trial, ik_path, str(trial_dir), log_callback=status.write)
             primary_sto = pick_primary_sto(sto_paths)
             status.write(f"Static Optimization completed: {primary_sto}")
 
